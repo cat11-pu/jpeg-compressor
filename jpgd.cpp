@@ -1669,7 +1669,7 @@ namespace jpgd {
 		int row = m_max_mcu_y_size - m_mcu_lines_left;
 		uint8* d0 = m_pScan_line_0;
 
-		const int half_image_x_size = (m_image_x_size >> 1) - 1;
+		const int half_image_x_size = (m_image_x_size - 1) >> 1;
 		const int row_x8 = row * 8;
 
 		for (int x = 0; x < m_image_x_size; x++)
@@ -1690,9 +1690,10 @@ namespace jpgd {
 
 			int w0 = (x & 1) ? 3 : 1;
 			int w1 = (x & 1) ? 1 : 3;
+			int bias = (x & 1) ? 2 : 1;
 
-			int cb = (cb0 * w0 + cb1 * w1 + 2) >> 2;
-			int cr = (cr0 * w0 + cr1 * w1 + 2) >> 2;
+			int cb = (cb0 * w0 + cb1 * w1 + bias) >> 2;
+			int cr = (cr0 * w0 + cr1 * w1 + bias) >> 2;
 
 			int rc = m_crr[cr];
 			int gc = ((m_crg[cr] + m_cbg[cb]) >> 16);
@@ -1762,7 +1763,7 @@ namespace jpgd {
 		int y = m_image_y_size - m_total_lines_left;
 		int row = y & 15;
 
-		const int half_image_y_size = (m_image_y_size >> 1) - 1;
+		const int half_image_y_size = (m_image_y_size - 1) >> 1;
 
 		uint8* d0 = m_pScan_line_0;
 
@@ -1771,10 +1772,16 @@ namespace jpgd {
 
 		int c_y0 = (y - 1) >> 1;
 		int c_y1 = JPGD_MIN(c_y0 + 1, half_image_y_size);
+		if (c_y0 < 0)
+		{
+			c_y0 = 0;
+			c_y1 = 0;
+		}
 
 		const uint8_t* p_YSamples = m_pSample_buf;
 		const uint8_t* p_C0Samples = m_pSample_buf;
-		if ((c_y0 >= 0) && (((row & 15) == 0) || ((row & 15) == 15)) && (m_total_lines_left > 1))
+		if ((y > 0) && (m_sample_buf_prev_valid) &&
+			(((row & 15) == 0) || (((row & 15) == 15) && (m_mcu_lines_left > 1))))
 		{
 			assert(y > 0);
 			assert(m_sample_buf_prev_valid);
@@ -1891,16 +1898,22 @@ namespace jpgd {
 		int y = m_image_y_size - m_total_lines_left;
 		int row = y & 15;
 
-		const int half_image_y_size = (m_image_y_size >> 1) - 1;
+		const int half_image_y_size = (m_image_y_size - 1) >> 1;
 
 		uint8* d0 = m_pScan_line_0;
 
 		int c_y0 = (y - 1) >> 1;
 		int c_y1 = JPGD_MIN(c_y0 + 1, half_image_y_size);
+		if (c_y0 < 0)
+		{
+			c_y0 = 0;
+			c_y1 = 0;
+		}
 
 		const uint8_t* p_YSamples = m_pSample_buf;
 		const uint8_t* p_C0Samples = m_pSample_buf;
-		if ((c_y0 >= 0) && (((row & 15) == 0) || ((row & 15) == 15)) && (m_total_lines_left > 1))
+		if ((y > 0) && (m_sample_buf_prev_valid) &&
+			(((row & 15) == 0) || (((row & 15) == 15) && (m_mcu_lines_left > 1))))
 		{
 			assert(y > 0);
 			assert(m_sample_buf_prev_valid);
@@ -1915,7 +1928,7 @@ namespace jpgd {
 		const int y0_base = (c_y0 & 7) * 8 + 256;
 		const int y1_base = (c_y1 & 7) * 8 + 256;
 
-		const int half_image_x_size = (m_image_x_size >> 1) - 1;
+		const int half_image_x_size = (m_image_x_size - 1) >> 1;
 
 		static const uint8_t s_muls[2][2][4] =
 		{
@@ -1958,10 +1971,11 @@ namespace jpgd {
 				int cb11_sample = m_pSample_buf[check_sample_buf_ofs(b + y1_base)];
 				int cr11_sample = m_pSample_buf[check_sample_buf_ofs(b + y1_base + 64)];
 
+				const int bias = (x & 1) ? 7 : 8;
 				{
 					const uint8_t* pMuls = &s_muls[row & 1][x & 1][0];
-					int cb = (cb00_sample * pMuls[0] + cb01_sample * pMuls[1] + cb10_sample * pMuls[2] + cb11_sample * pMuls[3] + 8) >> 4;
-					int cr = (cr00_sample * pMuls[0] + cr01_sample * pMuls[1] + cr10_sample * pMuls[2] + cr11_sample * pMuls[3] + 8) >> 4;
+					int cb = (cb00_sample * pMuls[0] + cb01_sample * pMuls[1] + cb10_sample * pMuls[2] + cb11_sample * pMuls[3] + bias) >> 4;
+					int cr = (cr00_sample * pMuls[0] + cr01_sample * pMuls[1] + cr10_sample * pMuls[2] + cr11_sample * pMuls[3] + bias) >> 4;
 
 					int rc = m_crr[cr];
 					int gc = ((m_crg[cr] + m_cbg[cb]) >> 16);
@@ -1977,8 +1991,8 @@ namespace jpgd {
 
 				{
 					const uint8_t* pMuls = &s_muls[(row + 1) & 1][x & 1][0];
-					int cb = (cb00_sample * pMuls[0] + cb01_sample * pMuls[1] + cb10_sample * pMuls[2] + cb11_sample * pMuls[3] + 8) >> 4;
-					int cr = (cr00_sample * pMuls[0] + cr01_sample * pMuls[1] + cr10_sample * pMuls[2] + cr11_sample * pMuls[3] + 8) >> 4;
+					int cb = (cb00_sample * pMuls[0] + cb01_sample * pMuls[1] + cb10_sample * pMuls[2] + cb11_sample * pMuls[3] + bias) >> 4;
+					int cr = (cr00_sample * pMuls[0] + cr01_sample * pMuls[1] + cr10_sample * pMuls[2] + cr11_sample * pMuls[3] + bias) >> 4;
 
 					int rc = m_crr[cr];
 					int gc = ((m_crg[cr] + m_cbg[cb]) >> 16);
@@ -2066,8 +2080,9 @@ namespace jpgd {
 				int cr11_sample = m_pSample_buf[check_sample_buf_ofs(b + y1_base + 64)];
 
 				const uint8_t* pMuls = &s_muls[row & 1][x & 1][0];
-				int cb = (cb00_sample * pMuls[0] + cb01_sample * pMuls[1] + cb10_sample * pMuls[2] + cb11_sample * pMuls[3] + 8) >> 4;
-				int cr = (cr00_sample * pMuls[0] + cr01_sample * pMuls[1] + cr10_sample * pMuls[2] + cr11_sample * pMuls[3] + 8) >> 4;
+				const int bias = (x & 1) ? 7 : 8;
+				int cb = (cb00_sample * pMuls[0] + cb01_sample * pMuls[1] + cb10_sample * pMuls[2] + cb11_sample * pMuls[3] + bias) >> 4;
+				int cr = (cr00_sample * pMuls[0] + cr01_sample * pMuls[1] + cr10_sample * pMuls[2] + cr11_sample * pMuls[3] + bias) >> 4;
 
 				int rc = m_crr[cr];
 				int gc = ((m_crg[cr] + m_cbg[cb]) >> 16);
