@@ -294,6 +294,18 @@ namespace jpgd {
 			k = k | (k << 8);
 			k = k | (k << 16);
 
+#if JPGD_USE_SSE2
+			if (use_simd)
+			{
+				const __m128i k8 = _mm_set1_epi8(static_cast<char>(k));
+				_mm_storeu_si128(reinterpret_cast<__m128i*>(pDst_ptr + 0), k8);
+				_mm_storeu_si128(reinterpret_cast<__m128i*>(pDst_ptr + 16), k8);
+				_mm_storeu_si128(reinterpret_cast<__m128i*>(pDst_ptr + 32), k8);
+				_mm_storeu_si128(reinterpret_cast<__m128i*>(pDst_ptr + 48), k8);
+				return;
+			}
+#endif
+
 			for (int i = 8; i > 0; i--)
 			{
 				*(int*)&pDst_ptr[0] = k;
@@ -527,11 +539,11 @@ namespace jpgd {
 			stop_decoding(JPGD_DECODE_ERROR);
 
 		int symbol;
-		// Check first 8-bits: do we have a complete symbol?
-		if ((symbol = pH->look_up[m_bit_buf >> 24]) < 0)
+		// Check the direct lookup prefix: do we have a complete symbol?
+		if ((symbol = pH->look_up[m_bit_buf >> (32 - JPGD_HUFF_LOOKUP_BITS)]) < 0)
 		{
 			// Decode more bits, use a tree traversal to find symbol.
-			int ofs = 23;
+			int ofs = 31 - JPGD_HUFF_LOOKUP_BITS;
 			do
 			{
 				unsigned int idx = -(int)(symbol + ((m_bit_buf >> ofs) & 1));
@@ -544,12 +556,13 @@ namespace jpgd {
 				ofs--;
 			} while (symbol < 0);
 
-			get_bits_no_markers(8 + (23 - ofs));
+			get_bits_no_markers(JPGD_HUFF_LOOKUP_BITS + (31 - JPGD_HUFF_LOOKUP_BITS - ofs));
 		}
 		else
 		{
-			assert(symbol < JPGD_HUFF_CODE_SIZE_MAX_LENGTH);
-			get_bits_no_markers(pH->code_size[symbol]);
+			const int code_size = symbol >> 8;
+			symbol &= 0xFF;
+			get_bits_no_markers(code_size);
 		}
 
 		return symbol;
@@ -563,11 +576,11 @@ namespace jpgd {
 		if (!pH)
 			stop_decoding(JPGD_DECODE_ERROR);
 
-		// Check first 8-bits: do we have a complete symbol?
-		if ((symbol = pH->look_up2[m_bit_buf >> 24]) < 0)
+		// Check the direct lookup prefix: do we have a complete symbol?
+		if ((symbol = pH->look_up[m_bit_buf >> (32 - JPGD_HUFF_LOOKUP_BITS)]) < 0)
 		{
 			// Use a tree traversal to find symbol.
-			int ofs = 23;
+			int ofs = 31 - JPGD_HUFF_LOOKUP_BITS;
 			do
 			{
 				unsigned int idx = -(int)(symbol + ((m_bit_buf >> ofs) & 1));
@@ -580,35 +593,34 @@ namespace jpgd {
 				ofs--;
 			} while (symbol < 0);
 
-			get_bits_no_markers(8 + (23 - ofs));
-
-			extra_bits = get_bits_no_markers(symbol & 0xF);
-		}
-		else
-		{
-			if (symbol & 0x8000)
+			const int code_size = JPGD_HUFF_LOOKUP_BITS + (31 - JPGD_HUFF_LOOKUP_BITS - ofs);
+			const int num_extra_bits = symbol & 0xF;
+			if (code_size + num_extra_bits <= 16)
 			{
-				//get_bits_no_markers((symbol >> 8) & 31);
-				assert(((symbol >> 8) & 31) <= 15);
-				get_bits_no_markers((symbol >> 8) & 15);
-				extra_bits = symbol >> 16;
+				const uint bits = get_bits_no_markers(code_size + num_extra_bits);
+				extra_bits = bits & ((1 << num_extra_bits) - 1);
 			}
 			else
 			{
-				int code_size = (symbol >> 8) & 31;
-				int num_extra_bits = symbol & 0xF;
-				int bits = code_size + num_extra_bits;
-
-				if (bits <= 16)
-					extra_bits = get_bits_no_markers(bits) & ((1 << num_extra_bits) - 1);
-				else
-				{
-					get_bits_no_markers(code_size);
-					extra_bits = get_bits_no_markers(num_extra_bits);
-				}
+				get_bits_no_markers(code_size);
+				extra_bits = get_bits_no_markers(num_extra_bits);
 			}
-
+		}
+		else
+		{
+			const int code_size = symbol >> 8;
 			symbol &= 0xFF;
+			const int num_extra_bits = symbol & 0xF;
+			if (code_size + num_extra_bits <= 16)
+			{
+				const uint bits = get_bits_no_markers(code_size + num_extra_bits);
+				extra_bits = bits & ((1 << num_extra_bits) - 1);
+			}
+			else
+			{
+				get_bits_no_markers(code_size);
+				extra_bits = get_bits_no_markers(num_extra_bits);
+			}
 		}
 
 		return symbol;
@@ -1267,6 +1279,7 @@ namespace jpgd {
 
 		m_pScan_line_0 = nullptr;
 		m_pScan_line_1 = nullptr;
+		m_pOutput_buffer = nullptr;
 
 		// Ready the input buffer.
 		prep_in_buffer();
@@ -1299,16 +1312,21 @@ namespace jpgd {
 #define ONE_HALF  ((int) 1 << (SCALEBITS-1))
 #define FIX(x)    ((int) ((x) * (1L<<SCALEBITS) + 0.5f))
 
+	static const int s_ycc_cr_r = FIX(1.40200f);
+	static const int s_ycc_cb_b = FIX(1.77200f);
+	static const int s_ycc_cr_g = FIX(0.71414f);
+	static const int s_ycc_cb_g = FIX(0.34414f);
+
 	// Create a few tables that allow us to quickly convert YCbCr to RGB.
 	void jpeg_decoder::create_look_ups()
 	{
 		for (int i = 0; i <= 255; i++)
 		{
 			int k = i - 128;
-			m_crr[i] = (FIX(1.40200f) * k + ONE_HALF) >> SCALEBITS;
-			m_cbb[i] = (FIX(1.77200f) * k + ONE_HALF) >> SCALEBITS;
-			m_crg[i] = (-FIX(0.71414f)) * k;
-			m_cbg[i] = (-FIX(0.34414f)) * k + ONE_HALF;
+			m_crr[i] = (s_ycc_cr_r * k + ONE_HALF) >> SCALEBITS;
+			m_cbb[i] = (s_ycc_cb_b * k + ONE_HALF) >> SCALEBITS;
+			m_crg[i] = (-s_ycc_cr_g) * k;
+			m_cbg[i] = (-s_ycc_cb_g) * k + ONE_HALF;
 		}
 	}
 
@@ -1492,6 +1510,8 @@ namespace jpgd {
 				if (m_comp_quant[component_id] >= JPGD_MAX_QUANT_TABLES)
 					stop_decoding(JPGD_DECODE_ERROR);
 
+				memset(p, 0, 64 * sizeof(jpgd_block_coeff_t));
+
 				jpgd_quant_t* q = m_quant[m_comp_quant[component_id]];
 
 				int r, s;
@@ -1504,8 +1524,6 @@ namespace jpgd {
 				m_last_dc_val[component_id] = (s += m_last_dc_val[component_id]);
 
 				p[0] = static_cast<jpgd_block_coeff_t>(s * q[0]);
-
-				int prev_num_set = m_mcu_block_max_zag[mcu_block];
 
 				huff_tables* pH = m_pHuff_tabs[m_comp_ac_tab[component_id]];
 
@@ -1525,14 +1543,6 @@ namespace jpgd {
 							if ((k + r) > 63)
 								stop_decoding(JPGD_DECODE_ERROR);
 
-							if (k < prev_num_set)
-							{
-								int n = JPGD_MIN(r, prev_num_set - k);
-								int kt = k;
-								while (n--)
-									p[g_ZAG[kt++]] = 0;
-							}
-
 							k += r;
 						}
 
@@ -1550,18 +1560,6 @@ namespace jpgd {
 							if ((k + 16) > 64)
 								stop_decoding(JPGD_DECODE_ERROR);
 
-							if (k < prev_num_set)
-							{
-								int n = JPGD_MIN(16, prev_num_set - k);
-								int kt = k;
-								while (n--)
-								{
-									if (kt > 63)
-										stop_decoding(JPGD_DECODE_ERROR);
-									p[g_ZAG[kt++]] = 0;
-								}
-							}
-
 							k += 16 - 1; // - 1 because the loop counter is k
 
 							if (p[g_ZAG[k & 63]] != 0)
@@ -1570,13 +1568,6 @@ namespace jpgd {
 						else
 							break;
 					}
-				}
-
-				if (k < prev_num_set)
-				{
-					int kt = k;
-					while (kt < prev_num_set)
-						p[g_ZAG[kt++]] = 0;
 				}
 
 				m_mcu_block_max_zag[mcu_block] = k;
@@ -1608,9 +1599,10 @@ namespace jpgd {
 				d[0] = clamp(y + m_crr[cr]);
 				d[1] = clamp(y + ((m_crg[cr] + m_cbg[cb]) >> 16));
 				d[2] = clamp(y + m_cbb[cb]);
-				d[3] = 255;
+				if (m_dest_bytes_per_pixel == 4)
+					d[3] = 255;
 
-				d += 4;
+				d += m_dest_bytes_per_pixel;
 			}
 
 			s += 64 * 3;
@@ -1642,15 +1634,17 @@ namespace jpgd {
 					d0[0] = clamp(yy + rc);
 					d0[1] = clamp(yy + gc);
 					d0[2] = clamp(yy + bc);
-					d0[3] = 255;
+					if (m_dest_bytes_per_pixel == 4)
+						d0[3] = 255;
 
 					yy = y[(j << 1) + 1];
-					d0[4] = clamp(yy + rc);
-					d0[5] = clamp(yy + gc);
-					d0[6] = clamp(yy + bc);
-					d0[7] = 255;
+					d0[m_dest_bytes_per_pixel + 0] = clamp(yy + rc);
+					d0[m_dest_bytes_per_pixel + 1] = clamp(yy + gc);
+					d0[m_dest_bytes_per_pixel + 2] = clamp(yy + bc);
+					if (m_dest_bytes_per_pixel == 4)
+						d0[m_dest_bytes_per_pixel + 3] = 255;
 
-					d0 += 8;
+					d0 += 2 * m_dest_bytes_per_pixel;
 
 					c++;
 				}
@@ -1701,9 +1695,10 @@ namespace jpgd {
 			d0[0] = clamp(y + rc);
 			d0[1] = clamp(y + gc);
 			d0[2] = clamp(y + bc);
-			d0[3] = 255;
+			if (m_dest_bytes_per_pixel == 4)
+				d0[3] = 255;
 
-			d0 += 4;
+			d0 += m_dest_bytes_per_pixel;
 		}
 	}
 
@@ -1738,16 +1733,18 @@ namespace jpgd {
 				d0[0] = clamp(yy + rc);
 				d0[1] = clamp(yy + gc);
 				d0[2] = clamp(yy + bc);
-				d0[3] = 255;
+				if (m_dest_bytes_per_pixel == 4)
+					d0[3] = 255;
 
 				yy = y[8 + j];
 				d1[0] = clamp(yy + rc);
 				d1[1] = clamp(yy + gc);
 				d1[2] = clamp(yy + bc);
-				d1[3] = 255;
+				if (m_dest_bytes_per_pixel == 4)
+					d1[3] = 255;
 
-				d0 += 4;
-				d1 += 4;
+				d0 += m_dest_bytes_per_pixel;
+				d1 += m_dest_bytes_per_pixel;
 			}
 
 			y += 64 * 4;
@@ -1813,9 +1810,10 @@ namespace jpgd {
 			d0[0] = clamp(y_sample + rc);
 			d0[1] = clamp(y_sample + gc);
 			d0[2] = clamp(y_sample + bc);
-			d0[3] = 255;
+			if (m_dest_bytes_per_pixel == 4)
+				d0[3] = 255;
 
-			d0 += 4;
+			d0 += m_dest_bytes_per_pixel;
 		}
 	}
 
@@ -1852,28 +1850,32 @@ namespace jpgd {
 					d0[0] = clamp(yy + rc);
 					d0[1] = clamp(yy + gc);
 					d0[2] = clamp(yy + bc);
-					d0[3] = 255;
+					if (m_dest_bytes_per_pixel == 4)
+						d0[3] = 255;
 
 					yy = y[j + 1];
-					d0[4] = clamp(yy + rc);
-					d0[5] = clamp(yy + gc);
-					d0[6] = clamp(yy + bc);
-					d0[7] = 255;
+					d0[m_dest_bytes_per_pixel + 0] = clamp(yy + rc);
+					d0[m_dest_bytes_per_pixel + 1] = clamp(yy + gc);
+					d0[m_dest_bytes_per_pixel + 2] = clamp(yy + bc);
+					if (m_dest_bytes_per_pixel == 4)
+						d0[m_dest_bytes_per_pixel + 3] = 255;
 
 					yy = y[j + 8];
 					d1[0] = clamp(yy + rc);
 					d1[1] = clamp(yy + gc);
 					d1[2] = clamp(yy + bc);
-					d1[3] = 255;
+					if (m_dest_bytes_per_pixel == 4)
+						d1[3] = 255;
 
 					yy = y[j + 8 + 1];
-					d1[4] = clamp(yy + rc);
-					d1[5] = clamp(yy + gc);
-					d1[6] = clamp(yy + bc);
-					d1[7] = 255;
+					d1[m_dest_bytes_per_pixel + 0] = clamp(yy + rc);
+					d1[m_dest_bytes_per_pixel + 1] = clamp(yy + gc);
+					d1[m_dest_bytes_per_pixel + 2] = clamp(yy + bc);
+					if (m_dest_bytes_per_pixel == 4)
+						d1[m_dest_bytes_per_pixel + 3] = 255;
 
-					d0 += 8;
-					d1 += 8;
+					d0 += 2 * m_dest_bytes_per_pixel;
+					d1 += 2 * m_dest_bytes_per_pixel;
 
 					c++;
 				}
@@ -1884,6 +1886,118 @@ namespace jpgd {
 			c += 64 * 6 - 8;
 		}
 	}
+
+#if JPGD_USE_SSE2
+	static inline __m128i load_u8x8_shifted_next(const uint8_t* p, int next_index)
+	{
+		const __m128i values = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p));
+		const __m128i next = _mm_slli_si128(_mm_cvtsi32_si128(p[next_index]), 7);
+		return _mm_or_si128(_mm_srli_si128(values, 1), next);
+	}
+
+	static inline void store_rgb24_pixels(uint8* dst, __m128i rgba)
+	{
+		uint32_t p0 = static_cast<uint32_t>(_mm_cvtsi128_si32(rgba)) & 0xFFFFFF;
+		uint32_t p1 = static_cast<uint32_t>(_mm_cvtsi128_si32(_mm_srli_si128(rgba, 4))) & 0xFFFFFF;
+		uint32_t p2 = static_cast<uint32_t>(_mm_cvtsi128_si32(_mm_srli_si128(rgba, 8))) & 0xFFFFFF;
+		uint32_t p3 = static_cast<uint32_t>(_mm_cvtsi128_si32(_mm_srli_si128(rgba, 12))) & 0xFFFFFF;
+
+		const uint64_t pair0 = static_cast<uint64_t>(p0) | (static_cast<uint64_t>(p1) << 24);
+		const uint64_t pair1 = static_cast<uint64_t>(p2) | (static_cast<uint64_t>(p3) << 24);
+		memcpy(dst, &pair0, 6);
+		memcpy(dst + 6, &pair1, 6);
+	}
+
+	static inline void store_interleaved_u8(uint8_t* dst, __m128i odd, __m128i even)
+	{
+		const __m128i lo = _mm_unpacklo_epi16(odd, even);
+		const __m128i hi = _mm_unpackhi_epi16(odd, even);
+		_mm_storeu_si128(reinterpret_cast<__m128i*>(dst), _mm_packus_epi16(lo, hi));
+	}
+
+	static inline void write_rgb8_sse2(uint8* dst, int dst_bpp, const uint8_t* y,
+		const uint8_t* cb, const uint8_t* cr)
+	{
+		const int s_ycc_cr_r_hi = (s_ycc_cr_r + ONE_HALF) >> SCALEBITS;
+		const int s_ycc_cr_r_lo = s_ycc_cr_r - (s_ycc_cr_r_hi << SCALEBITS);
+		const int s_ycc_cb_b_hi = (s_ycc_cb_b + ONE_HALF) >> SCALEBITS;
+		const int s_ycc_cb_b_lo = s_ycc_cb_b - (s_ycc_cb_b_hi << SCALEBITS);
+		const int s_ycc_cr_g_hi = -((s_ycc_cr_g + ONE_HALF) >> SCALEBITS);
+		const int s_ycc_cr_g_lo = -s_ycc_cr_g - (s_ycc_cr_g_hi * (1 << SCALEBITS));
+		const int s_ycc_cb_g_lo = -s_ycc_cb_g;
+
+		const __m128i zero = _mm_setzero_si128();
+		const __m128i round = _mm_set1_epi32(ONE_HALF);
+		const __m128i y16 = _mm_unpacklo_epi8(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(y)), zero);
+		const __m128i cb16 = _mm_unpacklo_epi8(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(cb)), zero);
+		const __m128i cr16 = _mm_unpacklo_epi8(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(cr)), zero);
+		const __m128i kc = _mm_sub_epi16(cr16, _mm_set1_epi16(128));
+		const __m128i kb = _mm_sub_epi16(cb16, _mm_set1_epi16(128));
+		const __m128i sign_c = _mm_srai_epi16(kc, 15);
+		const __m128i sign_b = _mm_srai_epi16(kb, 15);
+
+		const __m128i kc_lo = _mm_unpacklo_epi16(kc, zero);
+		const __m128i kc_hi = _mm_unpackhi_epi16(kc, zero);
+		const __m128i kb_lo = _mm_unpacklo_epi16(kb, zero);
+		const __m128i kb_hi = _mm_unpackhi_epi16(kb, zero);
+		const __m128i kc_lo32 = _mm_unpacklo_epi16(kc, sign_c);
+		const __m128i kc_hi32 = _mm_unpackhi_epi16(kc, sign_c);
+		const __m128i kb_lo32 = _mm_unpacklo_epi16(kb, sign_b);
+		const __m128i kb_hi32 = _mm_unpackhi_epi16(kb, sign_b);
+
+		const __m128i r_mul = _mm_set1_epi32(static_cast<uint16_t>(s_ycc_cr_r_lo));
+		const __m128i b_mul = _mm_set1_epi32(static_cast<uint16_t>(s_ycc_cb_b_lo));
+		const __m128i g_mul = _mm_set1_epi32(
+			static_cast<uint16_t>(s_ycc_cr_g_lo) |
+			(static_cast<uint32_t>(static_cast<uint16_t>(s_ycc_cb_g_lo)) << 16));
+
+		__m128i r_lo = _mm_srai_epi32(_mm_add_epi32(_mm_madd_epi16(kc_lo, r_mul), round), 16);
+		__m128i r_hi = _mm_srai_epi32(_mm_add_epi32(_mm_madd_epi16(kc_hi, r_mul), round), 16);
+		__m128i b_lo = _mm_srai_epi32(_mm_add_epi32(_mm_madd_epi16(kb_lo, b_mul), round), 16);
+		__m128i b_hi = _mm_srai_epi32(_mm_add_epi32(_mm_madd_epi16(kb_hi, b_mul), round), 16);
+		__m128i g_lo = _mm_srai_epi32(_mm_add_epi32(
+			_mm_madd_epi16(_mm_unpacklo_epi16(kc, kb), g_mul), round), 16);
+		__m128i g_hi = _mm_srai_epi32(_mm_add_epi32(
+			_mm_madd_epi16(_mm_unpackhi_epi16(kc, kb), g_mul), round), 16);
+
+		r_lo = _mm_add_epi32(r_lo, kc_lo32);
+		r_hi = _mm_add_epi32(r_hi, kc_hi32);
+		b_lo = _mm_add_epi32(b_lo, _mm_slli_epi32(kb_lo32, 1));
+		b_hi = _mm_add_epi32(b_hi, _mm_slli_epi32(kb_hi32, 1));
+		g_lo = _mm_sub_epi32(g_lo, kc_lo32);
+		g_hi = _mm_sub_epi32(g_hi, kc_hi32);
+
+		r_lo = _mm_add_epi32(r_lo, _mm_unpacklo_epi16(y16, zero));
+		r_hi = _mm_add_epi32(r_hi, _mm_unpackhi_epi16(y16, zero));
+		g_lo = _mm_add_epi32(g_lo, _mm_unpacklo_epi16(y16, zero));
+		g_hi = _mm_add_epi32(g_hi, _mm_unpackhi_epi16(y16, zero));
+		b_lo = _mm_add_epi32(b_lo, _mm_unpacklo_epi16(y16, zero));
+		b_hi = _mm_add_epi32(b_hi, _mm_unpackhi_epi16(y16, zero));
+
+		const __m128i r16 = _mm_packs_epi32(r_lo, r_hi);
+		const __m128i g16 = _mm_packs_epi32(g_lo, g_hi);
+		const __m128i b16 = _mm_packs_epi32(b_lo, b_hi);
+		const __m128i r8 = _mm_packus_epi16(r16, r16);
+		const __m128i g8 = _mm_packus_epi16(g16, g16);
+		const __m128i b8 = _mm_packus_epi16(b16, b16);
+		const __m128i a8 = _mm_set1_epi8(static_cast<char>(255));
+		const __m128i rg = _mm_unpacklo_epi8(r8, g8);
+		const __m128i ba = _mm_unpacklo_epi8(b8, a8);
+		const __m128i rgba0 = _mm_unpacklo_epi16(rg, ba);
+		const __m128i rgba1 = _mm_unpackhi_epi16(rg, ba);
+
+		if (dst_bpp == 4)
+		{
+			_mm_storeu_si128(reinterpret_cast<__m128i*>(dst), rgba0);
+			_mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 16), rgba1);
+		}
+		else
+		{
+			store_rgb24_pixels(dst, rgba0);
+			store_rgb24_pixels(dst + 12, rgba1);
+		}
+	}
+#endif
 
 	uint32_t jpeg_decoder::H2V2ConvertFiltered()
 	{
@@ -1915,12 +2029,33 @@ namespace jpgd {
 		const int y0_base = (c_y0 & 7) * 8 + 256;
 		const int y1_base = (c_y1 & 7) * 8 + 256;
 
-		const int half_image_x_size = (m_image_x_size >> 1) - 1;
+		const int last_c_x = (m_image_x_size >> 1) - 1;
+		const bool use_simd = ((m_flags & cFlagDisableSIMD) == 0) && m_has_sse2;
 
-		static const uint8_t s_muls[2][2][4] =
+		auto write_pixel = [this](uint8* dst, int y_sample, int cb, int cr)
 		{
-			{ { 1, 3, 3, 9 }, { 3, 9, 1, 3 }, },
-			{ { 3, 1, 9, 3 }, { 9, 3, 3, 1 } }
+			const int rc = m_crr[cr];
+			const int gc = ((m_crg[cr] + m_cbg[cb]) >> 16);
+			const int bc = m_cbb[cb];
+
+			dst[0] = static_cast<uint8>(clamp(y_sample + rc));
+			dst[1] = static_cast<uint8>(clamp(y_sample + gc));
+			dst[2] = static_cast<uint8>(clamp(y_sample + bc));
+			if (m_dest_bytes_per_pixel == 4)
+				dst[3] = 255;
+		};
+
+		auto write_rgb8 = [this, &write_pixel, use_simd](uint8* dst, const uint8_t* ys, const uint8_t* cbs, const uint8_t* crs)
+		{
+#if JPGD_USE_SSE2
+			if (use_simd)
+			{
+				write_rgb8_sse2(dst, m_dest_bytes_per_pixel, ys, cbs, crs);
+				return;
+			}
+#endif
+			for (int i = 0; i < 8; i++)
+				write_pixel(dst + i * m_dest_bytes_per_pixel, ys[i], cbs[i], crs[i]);
 		};
 
 		if (((row & 15) >= 1) && ((row & 15) <= 14))
@@ -1934,151 +2069,325 @@ namespace jpgd {
 			uint8* d1 = m_pScan_line_1;
 			const int y_sample_base_ofs1 = (((row + 1) & 8) ? 128 : 0) + ((row + 1) & 7) * 8;
 
-			for (int x = 0; x < m_image_x_size; x++)
+			if (m_image_x_size > 0)
 			{
-				int k = (x >> 4) * BLOCKS_PER_MCU * 64 + ((x & 8) ? 64 : 0) + (x & 7);
-				int y_sample0 = p_YSamples[check_sample_buf_ofs(k + y_sample_base_ofs)];
-				int y_sample1 = p_YSamples[check_sample_buf_ofs(k + y_sample_base_ofs1)];
+				const int cb00_sample = p_C0Samples[check_sample_buf_ofs(y0_base)];
+				const int cr00_sample = p_C0Samples[check_sample_buf_ofs(y0_base + 64)];
+				const int cb01_sample = m_pSample_buf[check_sample_buf_ofs(y1_base)];
+				const int cr01_sample = m_pSample_buf[check_sample_buf_ofs(y1_base + 64)];
 
-				int c_x0 = (x - 1) >> 1;
-				int c_x1 = JPGD_MIN(c_x0 + 1, half_image_x_size);
-				c_x0 = JPGD_MAX(c_x0, 0);
+				const int cb0 = (3 * cb00_sample + cb01_sample + 2) >> 2;
+				const int cr0 = (3 * cr00_sample + cr01_sample + 2) >> 2;
+				const int cb1 = (cb00_sample + 3 * cb01_sample + 2) >> 2;
+				const int cr1 = (cr00_sample + 3 * cr01_sample + 2) >> 2;
 
-				int a = (c_x0 >> 3) * BLOCKS_PER_MCU * 64 + (c_x0 & 7);
-				int cb00_sample = p_C0Samples[check_sample_buf_ofs(a + y0_base)];
-				int cr00_sample = p_C0Samples[check_sample_buf_ofs(a + y0_base + 64)];
+				write_pixel(d0, p_YSamples[check_sample_buf_ofs(y_sample_base_ofs)], cb0, cr0);
+				write_pixel(d1, p_YSamples[check_sample_buf_ofs(y_sample_base_ofs1)], cb1, cr1);
+				d0 += m_dest_bytes_per_pixel;
+				d1 += m_dest_bytes_per_pixel;
+			}
 
-				int cb01_sample = m_pSample_buf[check_sample_buf_ofs(a + y1_base)];
-				int cr01_sample = m_pSample_buf[check_sample_buf_ofs(a + y1_base + 64)];
+			int c_x0 = 0;
 
-				int b = (c_x1 >> 3) * BLOCKS_PER_MCU * 64 + (c_x1 & 7);
-				int cb10_sample = p_C0Samples[check_sample_buf_ofs(b + y0_base)];
-				int cr10_sample = p_C0Samples[check_sample_buf_ofs(b + y0_base + 64)];
+#if JPGD_USE_SSE2
+			if (use_simd)
+			{
+				const int chroma_count = m_image_x_size >> 1;
+				const __m128i zero = _mm_setzero_si128();
+				const __m128i round = _mm_set1_epi16(8);
+				uint8_t y0_vec[16], y1_vec[16];
+				uint8_t cb0_vec[16], cb1_vec[16], cr0_vec[16], cr1_vec[16];
 
-				int cb11_sample = m_pSample_buf[check_sample_buf_ofs(b + y1_base)];
-				int cr11_sample = m_pSample_buf[check_sample_buf_ofs(b + y1_base + 64)];
-
+				for (; c_x0 + 8 < chroma_count; c_x0 += 8)
 				{
-					const uint8_t* pMuls = &s_muls[row & 1][x & 1][0];
-					int cb = (cb00_sample * pMuls[0] + cb01_sample * pMuls[1] + cb10_sample * pMuls[2] + cb11_sample * pMuls[3] + 8) >> 4;
-					int cr = (cr00_sample * pMuls[0] + cr01_sample * pMuls[1] + cr10_sample * pMuls[2] + cr11_sample * pMuls[3] + 8) >> 4;
+					const int a = (c_x0 >> 3) * BLOCKS_PER_MCU * 64;
+					const uint8_t* pc0 = p_C0Samples + a + y0_base;
+					const uint8_t* ps0 = m_pSample_buf + a + y1_base;
 
-					int rc = m_crr[cr];
-					int gc = ((m_crg[cr] + m_cbg[cb]) >> 16);
-					int bc = m_cbb[cb];
+					const __m128i cb00 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(pc0));
+					const __m128i cr00 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(pc0 + 64));
+					const __m128i cb01 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(ps0));
+					const __m128i cr01 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(ps0 + 64));
+					const __m128i cb10 = load_u8x8_shifted_next(pc0, 384);
+					const __m128i cr10 = load_u8x8_shifted_next(pc0 + 64, 384);
+					const __m128i cb11 = load_u8x8_shifted_next(ps0, 384);
+					const __m128i cr11 = load_u8x8_shifted_next(ps0 + 64, 384);
 
-					d0[0] = clamp(y_sample0 + rc);
-					d0[1] = clamp(y_sample0 + gc);
-					d0[2] = clamp(y_sample0 + bc);
-					d0[3] = 255;
+					const __m128i cb00_16 = _mm_unpacklo_epi8(cb00, zero);
+					const __m128i cb01_16 = _mm_unpacklo_epi8(cb01, zero);
+					const __m128i cb10_16 = _mm_unpacklo_epi8(cb10, zero);
+					const __m128i cb11_16 = _mm_unpacklo_epi8(cb11, zero);
+					const __m128i cr00_16 = _mm_unpacklo_epi8(cr00, zero);
+					const __m128i cr01_16 = _mm_unpacklo_epi8(cr01, zero);
+					const __m128i cr10_16 = _mm_unpacklo_epi8(cr10, zero);
+					const __m128i cr11_16 = _mm_unpacklo_epi8(cr11, zero);
 
-					d0 += 4;
+					const __m128i cb_y0_even = _mm_add_epi16(cb00_16, _mm_add_epi16(cb10_16, _mm_slli_epi16(cb10_16, 1)));
+					const __m128i cb_y0_odd = _mm_add_epi16(cb10_16, _mm_add_epi16(cb00_16, _mm_slli_epi16(cb00_16, 1)));
+					const __m128i cb_y1_even = _mm_add_epi16(cb01_16, _mm_add_epi16(cb11_16, _mm_slli_epi16(cb11_16, 1)));
+					const __m128i cb_y1_odd = _mm_add_epi16(cb11_16, _mm_add_epi16(cb01_16, _mm_slli_epi16(cb01_16, 1)));
+					const __m128i cr_y0_even = _mm_add_epi16(cr00_16, _mm_add_epi16(cr10_16, _mm_slli_epi16(cr10_16, 1)));
+					const __m128i cr_y0_odd = _mm_add_epi16(cr10_16, _mm_add_epi16(cr00_16, _mm_slli_epi16(cr00_16, 1)));
+					const __m128i cr_y1_even = _mm_add_epi16(cr01_16, _mm_add_epi16(cr11_16, _mm_slli_epi16(cr11_16, 1)));
+					const __m128i cr_y1_odd = _mm_add_epi16(cr11_16, _mm_add_epi16(cr01_16, _mm_slli_epi16(cr01_16, 1)));
+
+					const __m128i cb_d0_odd = _mm_srai_epi16(_mm_add_epi16(
+						_mm_add_epi16(cb_y0_odd, _mm_slli_epi16(cb_y0_odd, 1)), _mm_add_epi16(cb_y1_odd, round)), 4);
+					const __m128i cr_d0_odd = _mm_srai_epi16(_mm_add_epi16(
+						_mm_add_epi16(cr_y0_odd, _mm_slli_epi16(cr_y0_odd, 1)), _mm_add_epi16(cr_y1_odd, round)), 4);
+					const __m128i cb_d0_even = _mm_srai_epi16(_mm_add_epi16(
+						_mm_add_epi16(cb_y0_even, _mm_slli_epi16(cb_y0_even, 1)), _mm_add_epi16(cb_y1_even, round)), 4);
+					const __m128i cr_d0_even = _mm_srai_epi16(_mm_add_epi16(
+						_mm_add_epi16(cr_y0_even, _mm_slli_epi16(cr_y0_even, 1)), _mm_add_epi16(cr_y1_even, round)), 4);
+					const __m128i cb_d1_odd = _mm_srai_epi16(_mm_add_epi16(
+						_mm_add_epi16(cb_y0_odd, round), _mm_add_epi16(cb_y1_odd, _mm_slli_epi16(cb_y1_odd, 1))), 4);
+					const __m128i cr_d1_odd = _mm_srai_epi16(_mm_add_epi16(
+						_mm_add_epi16(cr_y0_odd, round), _mm_add_epi16(cr_y1_odd, _mm_slli_epi16(cr_y1_odd, 1))), 4);
+					const __m128i cb_d1_even = _mm_srai_epi16(_mm_add_epi16(
+						_mm_add_epi16(cb_y0_even, round), _mm_add_epi16(cb_y1_even, _mm_slli_epi16(cb_y1_even, 1))), 4);
+					const __m128i cr_d1_even = _mm_srai_epi16(_mm_add_epi16(
+						_mm_add_epi16(cr_y0_even, round), _mm_add_epi16(cr_y1_even, _mm_slli_epi16(cr_y1_even, 1))), 4);
+
+					store_interleaved_u8(cb0_vec, cb_d0_odd, cb_d0_even);
+					store_interleaved_u8(cr0_vec, cr_d0_odd, cr_d0_even);
+					store_interleaved_u8(cb1_vec, cb_d1_odd, cb_d1_even);
+					store_interleaved_u8(cr1_vec, cr_d1_odd, cr_d1_even);
+
+					const uint8_t* pY0 = p_YSamples + a + y_sample_base_ofs;
+					const uint8_t* pY1 = p_YSamples + a + y_sample_base_ofs1;
+					_mm_storel_epi64(reinterpret_cast<__m128i*>(y0_vec),
+						load_u8x8_shifted_next(pY0, 64));
+					_mm_storel_epi64(reinterpret_cast<__m128i*>(y0_vec + 8),
+						load_u8x8_shifted_next(pY0 + 64, 320));
+					_mm_storel_epi64(reinterpret_cast<__m128i*>(y1_vec),
+						load_u8x8_shifted_next(pY1, 64));
+					_mm_storel_epi64(reinterpret_cast<__m128i*>(y1_vec + 8),
+						load_u8x8_shifted_next(pY1 + 64, 320));
+
+					write_rgb8(d0, y0_vec, cb0_vec, cr0_vec);
+					write_rgb8(d0 + 8 * m_dest_bytes_per_pixel, y0_vec + 8, cb0_vec + 8, cr0_vec + 8);
+					write_rgb8(d1, y1_vec, cb1_vec, cr1_vec);
+					write_rgb8(d1 + 8 * m_dest_bytes_per_pixel, y1_vec + 8, cb1_vec + 8, cr1_vec + 8);
+					d0 += 16 * m_dest_bytes_per_pixel;
+					d1 += 16 * m_dest_bytes_per_pixel;
+				}
+			}
+#endif
+
+			uint8_t y0_buf[8], y1_buf[8], cb0_buf[8], cb1_buf[8], cr0_buf[8], cr1_buf[8];
+			int batch_count = 0;
+
+			for (; c_x0 < (m_image_x_size >> 1); c_x0++)
+			{
+				const int c_x1 = JPGD_MIN(c_x0 + 1, last_c_x);
+				const int a = (c_x0 >> 3) * BLOCKS_PER_MCU * 64 + (c_x0 & 7);
+				const int b = (c_x1 >> 3) * BLOCKS_PER_MCU * 64 + (c_x1 & 7);
+
+				const int cb00_sample = p_C0Samples[check_sample_buf_ofs(a + y0_base)];
+				const int cr00_sample = p_C0Samples[check_sample_buf_ofs(a + y0_base + 64)];
+				const int cb01_sample = m_pSample_buf[check_sample_buf_ofs(a + y1_base)];
+				const int cr01_sample = m_pSample_buf[check_sample_buf_ofs(a + y1_base + 64)];
+				const int cb10_sample = p_C0Samples[check_sample_buf_ofs(b + y0_base)];
+				const int cr10_sample = p_C0Samples[check_sample_buf_ofs(b + y0_base + 64)];
+				const int cb11_sample = m_pSample_buf[check_sample_buf_ofs(b + y1_base)];
+				const int cr11_sample = m_pSample_buf[check_sample_buf_ofs(b + y1_base + 64)];
+
+				const int cb_y0_even = cb00_sample + 3 * cb10_sample;
+				const int cb_y0_odd = 3 * cb00_sample + cb10_sample;
+				const int cb_y1_even = cb01_sample + 3 * cb11_sample;
+				const int cb_y1_odd = 3 * cb01_sample + cb11_sample;
+				const int cr_y0_even = cr00_sample + 3 * cr10_sample;
+				const int cr_y0_odd = 3 * cr00_sample + cr10_sample;
+				const int cr_y1_even = cr01_sample + 3 * cr11_sample;
+				const int cr_y1_odd = 3 * cr01_sample + cr11_sample;
+
+				const int cb00 = (3 * cb_y0_odd + cb_y1_odd + 8) >> 4;
+				const int cr00 = (3 * cr_y0_odd + cr_y1_odd + 8) >> 4;
+				const int cb01 = (3 * cb_y0_even + cb_y1_even + 8) >> 4;
+				const int cr01 = (3 * cr_y0_even + cr_y1_even + 8) >> 4;
+				const int cb10 = (cb_y0_odd + 3 * cb_y1_odd + 8) >> 4;
+				const int cr10 = (cr_y0_odd + 3 * cr_y1_odd + 8) >> 4;
+				const int cb11 = (cb_y0_even + 3 * cb_y1_even + 8) >> 4;
+				const int cr11 = (cr_y0_even + 3 * cr_y1_even + 8) >> 4;
+
+				const int x0 = 2 * c_x0 + 1;
+				const int x1 = x0 + 1;
+
+				int k = (x0 >> 4) * BLOCKS_PER_MCU * 64 + ((x0 & 8) ? 64 : 0) + (x0 & 7);
+				y0_buf[batch_count] = p_YSamples[check_sample_buf_ofs(k + y_sample_base_ofs)];
+				y1_buf[batch_count] = p_YSamples[check_sample_buf_ofs(k + y_sample_base_ofs1)];
+				cb0_buf[batch_count] = static_cast<uint8_t>(cb00);
+				cb1_buf[batch_count] = static_cast<uint8_t>(cb10);
+				cr0_buf[batch_count] = static_cast<uint8_t>(cr00);
+				cr1_buf[batch_count] = static_cast<uint8_t>(cr10);
+				batch_count++;
+
+				if (x1 < m_image_x_size)
+				{
+					k = (x1 >> 4) * BLOCKS_PER_MCU * 64 + ((x1 & 8) ? 64 : 0) + (x1 & 7);
+					y0_buf[batch_count] = p_YSamples[check_sample_buf_ofs(k + y_sample_base_ofs)];
+					y1_buf[batch_count] = p_YSamples[check_sample_buf_ofs(k + y_sample_base_ofs1)];
+					cb0_buf[batch_count] = static_cast<uint8_t>(cb01);
+					cb1_buf[batch_count] = static_cast<uint8_t>(cb11);
+					cr0_buf[batch_count] = static_cast<uint8_t>(cr01);
+					cr1_buf[batch_count] = static_cast<uint8_t>(cr11);
+					batch_count++;
 				}
 
+				if (batch_count == 8)
 				{
-					const uint8_t* pMuls = &s_muls[(row + 1) & 1][x & 1][0];
-					int cb = (cb00_sample * pMuls[0] + cb01_sample * pMuls[1] + cb10_sample * pMuls[2] + cb11_sample * pMuls[3] + 8) >> 4;
-					int cr = (cr00_sample * pMuls[0] + cr01_sample * pMuls[1] + cr10_sample * pMuls[2] + cr11_sample * pMuls[3] + 8) >> 4;
-
-					int rc = m_crr[cr];
-					int gc = ((m_crg[cr] + m_cbg[cb]) >> 16);
-					int bc = m_cbb[cb];
-
-					d1[0] = clamp(y_sample1 + rc);
-					d1[1] = clamp(y_sample1 + gc);
-					d1[2] = clamp(y_sample1 + bc);
-					d1[3] = 255;
-
-					d1 += 4;
+					write_rgb8(d0, y0_buf, cb0_buf, cr0_buf);
+					write_rgb8(d1, y1_buf, cb1_buf, cr1_buf);
+					d0 += 8 * m_dest_bytes_per_pixel;
+					d1 += 8 * m_dest_bytes_per_pixel;
+					batch_count = 0;
 				}
+			}
 
-				if (((x & 1) == 1) && (x < m_image_x_size - 1))
-				{
-					const int nx = x + 1;
-					assert(c_x0 == (nx - 1) >> 1);
-
-					k = (nx >> 4) * BLOCKS_PER_MCU * 64 + ((nx & 8) ? 64 : 0) + (nx & 7);
-					y_sample0 = p_YSamples[check_sample_buf_ofs(k + y_sample_base_ofs)];
-					y_sample1 = p_YSamples[check_sample_buf_ofs(k + y_sample_base_ofs1)];
-
-					{
-						const uint8_t* pMuls = &s_muls[row & 1][nx & 1][0];
-						int cb = (cb00_sample * pMuls[0] + cb01_sample * pMuls[1] + cb10_sample * pMuls[2] + cb11_sample * pMuls[3] + 8) >> 4;
-						int cr = (cr00_sample * pMuls[0] + cr01_sample * pMuls[1] + cr10_sample * pMuls[2] + cr11_sample * pMuls[3] + 8) >> 4;
-
-						int rc = m_crr[cr];
-						int gc = ((m_crg[cr] + m_cbg[cb]) >> 16);
-						int bc = m_cbb[cb];
-
-						d0[0] = clamp(y_sample0 + rc);
-						d0[1] = clamp(y_sample0 + gc);
-						d0[2] = clamp(y_sample0 + bc);
-						d0[3] = 255;
-
-						d0 += 4;
-					}
-
-					{
-						const uint8_t* pMuls = &s_muls[(row + 1) & 1][nx & 1][0];
-						int cb = (cb00_sample * pMuls[0] + cb01_sample * pMuls[1] + cb10_sample * pMuls[2] + cb11_sample * pMuls[3] + 8) >> 4;
-						int cr = (cr00_sample * pMuls[0] + cr01_sample * pMuls[1] + cr10_sample * pMuls[2] + cr11_sample * pMuls[3] + 8) >> 4;
-
-						int rc = m_crr[cr];
-						int gc = ((m_crg[cr] + m_cbg[cb]) >> 16);
-						int bc = m_cbb[cb];
-
-						d1[0] = clamp(y_sample1 + rc);
-						d1[1] = clamp(y_sample1 + gc);
-						d1[2] = clamp(y_sample1 + bc);
-						d1[3] = 255;
-
-						d1 += 4;
-					}
-
-					++x;
-				}
+			for (int i = 0; i < batch_count; i++)
+			{
+				write_pixel(d0, y0_buf[i], cb0_buf[i], cr0_buf[i]);
+				write_pixel(d1, y1_buf[i], cb1_buf[i], cr1_buf[i]);
+				d0 += m_dest_bytes_per_pixel;
+				d1 += m_dest_bytes_per_pixel;
 			}
 
 			return 2;
 		}
 		else
 		{
-			for (int x = 0; x < m_image_x_size; x++)
+			const bool row_odd = ((row & 15) == 15);
+			const int v0 = row_odd ? 3 : 1;
+			const int v1 = row_odd ? 1 : 3;
+
+			if (m_image_x_size > 0)
 			{
-				int y_sample = p_YSamples[check_sample_buf_ofs((x >> 4) * BLOCKS_PER_MCU * 64 + ((x & 8) ? 64 : 0) + (x & 7) + y_sample_base_ofs)];
+				const int cb00_sample = p_C0Samples[check_sample_buf_ofs(y0_base)];
+				const int cr00_sample = p_C0Samples[check_sample_buf_ofs(y0_base + 64)];
+				const int cb01_sample = m_pSample_buf[check_sample_buf_ofs(y1_base)];
+				const int cr01_sample = m_pSample_buf[check_sample_buf_ofs(y1_base + 64)];
+				const int cb = (v0 * cb00_sample + v1 * cb01_sample + 2) >> 2;
+				const int cr = (v0 * cr00_sample + v1 * cr01_sample + 2) >> 2;
 
-				int c_x0 = (x - 1) >> 1;
-				int c_x1 = JPGD_MIN(c_x0 + 1, half_image_x_size);
-				c_x0 = JPGD_MAX(c_x0, 0);
+				write_pixel(d0, p_YSamples[check_sample_buf_ofs(y_sample_base_ofs)], cb, cr);
+				d0 += m_dest_bytes_per_pixel;
+			}
 
-				int a = (c_x0 >> 3) * BLOCKS_PER_MCU * 64 + (c_x0 & 7);
-				int cb00_sample = p_C0Samples[check_sample_buf_ofs(a + y0_base)];
-				int cr00_sample = p_C0Samples[check_sample_buf_ofs(a + y0_base + 64)];
+			int c_x0 = 0;
 
-				int cb01_sample = m_pSample_buf[check_sample_buf_ofs(a + y1_base)];
-				int cr01_sample = m_pSample_buf[check_sample_buf_ofs(a + y1_base + 64)];
+#if JPGD_USE_SSE2
+			if (use_simd)
+			{
+				const int chroma_count = m_image_x_size >> 1;
+				const __m128i zero = _mm_setzero_si128();
+				const __m128i round = _mm_set1_epi16(8);
+				uint8_t y_vec[16], cb_vec[16], cr_vec[16];
 
-				int b = (c_x1 >> 3) * BLOCKS_PER_MCU * 64 + (c_x1 & 7);
-				int cb10_sample = p_C0Samples[check_sample_buf_ofs(b + y0_base)];
-				int cr10_sample = p_C0Samples[check_sample_buf_ofs(b + y0_base + 64)];
+				for (; c_x0 + 8 < chroma_count; c_x0 += 8)
+				{
+					const int a = (c_x0 >> 3) * BLOCKS_PER_MCU * 64;
+					const uint8_t* pc0 = p_C0Samples + a + y0_base;
+					const uint8_t* ps0 = m_pSample_buf + a + y1_base;
+					const __m128i cb00 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(pc0));
+					const __m128i cr00 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(pc0 + 64));
+					const __m128i cb01 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(ps0));
+					const __m128i cr01 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(ps0 + 64));
+					const __m128i cb10 = load_u8x8_shifted_next(pc0, 384);
+					const __m128i cr10 = load_u8x8_shifted_next(pc0 + 64, 384);
+					const __m128i cb11 = load_u8x8_shifted_next(ps0, 384);
+					const __m128i cr11 = load_u8x8_shifted_next(ps0 + 64, 384);
 
-				int cb11_sample = m_pSample_buf[check_sample_buf_ofs(b + y1_base)];
-				int cr11_sample = m_pSample_buf[check_sample_buf_ofs(b + y1_base + 64)];
+					const __m128i cb00_16 = _mm_unpacklo_epi8(cb00, zero);
+					const __m128i cb01_16 = _mm_unpacklo_epi8(cb01, zero);
+					const __m128i cb10_16 = _mm_unpacklo_epi8(cb10, zero);
+					const __m128i cb11_16 = _mm_unpacklo_epi8(cb11, zero);
+					const __m128i cr00_16 = _mm_unpacklo_epi8(cr00, zero);
+					const __m128i cr01_16 = _mm_unpacklo_epi8(cr01, zero);
+					const __m128i cr10_16 = _mm_unpacklo_epi8(cr10, zero);
+					const __m128i cr11_16 = _mm_unpacklo_epi8(cr11, zero);
+					const __m128i cb_y0_even = _mm_add_epi16(cb00_16, _mm_add_epi16(cb10_16, _mm_slli_epi16(cb10_16, 1)));
+					const __m128i cb_y0_odd = _mm_add_epi16(cb10_16, _mm_add_epi16(cb00_16, _mm_slli_epi16(cb00_16, 1)));
+					const __m128i cb_y1_even = _mm_add_epi16(cb01_16, _mm_add_epi16(cb11_16, _mm_slli_epi16(cb11_16, 1)));
+					const __m128i cb_y1_odd = _mm_add_epi16(cb11_16, _mm_add_epi16(cb01_16, _mm_slli_epi16(cb01_16, 1)));
+					const __m128i cr_y0_even = _mm_add_epi16(cr00_16, _mm_add_epi16(cr10_16, _mm_slli_epi16(cr10_16, 1)));
+					const __m128i cr_y0_odd = _mm_add_epi16(cr10_16, _mm_add_epi16(cr00_16, _mm_slli_epi16(cr00_16, 1)));
+					const __m128i cr_y1_even = _mm_add_epi16(cr01_16, _mm_add_epi16(cr11_16, _mm_slli_epi16(cr11_16, 1)));
+					const __m128i cr_y1_odd = _mm_add_epi16(cr11_16, _mm_add_epi16(cr01_16, _mm_slli_epi16(cr01_16, 1)));
 
-				const uint8_t* pMuls = &s_muls[row & 1][x & 1][0];
-				int cb = (cb00_sample * pMuls[0] + cb01_sample * pMuls[1] + cb10_sample * pMuls[2] + cb11_sample * pMuls[3] + 8) >> 4;
-				int cr = (cr00_sample * pMuls[0] + cr01_sample * pMuls[1] + cr10_sample * pMuls[2] + cr11_sample * pMuls[3] + 8) >> 4;
+					__m128i cb_odd, cb_even, cr_odd, cr_even;
+					if (row_odd)
+					{
+						cb_odd = _mm_add_epi16(_mm_add_epi16(cb_y0_odd, _mm_slli_epi16(cb_y0_odd, 1)), cb_y1_odd);
+						cb_even = _mm_add_epi16(_mm_add_epi16(cb_y0_even, _mm_slli_epi16(cb_y0_even, 1)), cb_y1_even);
+						cr_odd = _mm_add_epi16(_mm_add_epi16(cr_y0_odd, _mm_slli_epi16(cr_y0_odd, 1)), cr_y1_odd);
+						cr_even = _mm_add_epi16(_mm_add_epi16(cr_y0_even, _mm_slli_epi16(cr_y0_even, 1)), cr_y1_even);
+					}
+					else
+					{
+						cb_odd = _mm_add_epi16(cb_y0_odd, _mm_add_epi16(cb_y1_odd, _mm_slli_epi16(cb_y1_odd, 1)));
+						cb_even = _mm_add_epi16(cb_y0_even, _mm_add_epi16(cb_y1_even, _mm_slli_epi16(cb_y1_even, 1)));
+						cr_odd = _mm_add_epi16(cr_y0_odd, _mm_add_epi16(cr_y1_odd, _mm_slli_epi16(cr_y1_odd, 1)));
+						cr_even = _mm_add_epi16(cr_y0_even, _mm_add_epi16(cr_y1_even, _mm_slli_epi16(cr_y1_even, 1)));
+					}
 
-				int rc = m_crr[cr];
-				int gc = ((m_crg[cr] + m_cbg[cb]) >> 16);
-				int bc = m_cbb[cb];
+					store_interleaved_u8(cb_vec, _mm_srai_epi16(_mm_add_epi16(cb_odd, round), 4),
+						_mm_srai_epi16(_mm_add_epi16(cb_even, round), 4));
+					store_interleaved_u8(cr_vec, _mm_srai_epi16(_mm_add_epi16(cr_odd, round), 4),
+						_mm_srai_epi16(_mm_add_epi16(cr_even, round), 4));
 
-				d0[0] = clamp(y_sample + rc);
-				d0[1] = clamp(y_sample + gc);
-				d0[2] = clamp(y_sample + bc);
-				d0[3] = 255;
+					const uint8_t* pY = p_YSamples + a + y_sample_base_ofs;
+					_mm_storel_epi64(reinterpret_cast<__m128i*>(y_vec), load_u8x8_shifted_next(pY, 64));
+					_mm_storel_epi64(reinterpret_cast<__m128i*>(y_vec + 8), load_u8x8_shifted_next(pY + 64, 320));
 
-				d0 += 4;
+					write_rgb8(d0, y_vec, cb_vec, cr_vec);
+					write_rgb8(d0 + 8 * m_dest_bytes_per_pixel, y_vec + 8, cb_vec + 8, cr_vec + 8);
+					d0 += 16 * m_dest_bytes_per_pixel;
+				}
+			}
+#endif
+
+			for (; c_x0 < (m_image_x_size >> 1); c_x0++)
+			{
+				const int c_x1 = JPGD_MIN(c_x0 + 1, last_c_x);
+				const int a = (c_x0 >> 3) * BLOCKS_PER_MCU * 64 + (c_x0 & 7);
+				const int b = (c_x1 >> 3) * BLOCKS_PER_MCU * 64 + (c_x1 & 7);
+
+				const int cb00_sample = p_C0Samples[check_sample_buf_ofs(a + y0_base)];
+				const int cr00_sample = p_C0Samples[check_sample_buf_ofs(a + y0_base + 64)];
+				const int cb01_sample = m_pSample_buf[check_sample_buf_ofs(a + y1_base)];
+				const int cr01_sample = m_pSample_buf[check_sample_buf_ofs(a + y1_base + 64)];
+				const int cb10_sample = p_C0Samples[check_sample_buf_ofs(b + y0_base)];
+				const int cr10_sample = p_C0Samples[check_sample_buf_ofs(b + y0_base + 64)];
+				const int cb11_sample = m_pSample_buf[check_sample_buf_ofs(b + y1_base)];
+				const int cr11_sample = m_pSample_buf[check_sample_buf_ofs(b + y1_base + 64)];
+
+				const int cb_y0_even = cb00_sample + 3 * cb10_sample;
+				const int cb_y0_odd = 3 * cb00_sample + cb10_sample;
+				const int cb_y1_even = cb01_sample + 3 * cb11_sample;
+				const int cb_y1_odd = 3 * cb01_sample + cb11_sample;
+				const int cr_y0_even = cr00_sample + 3 * cr10_sample;
+				const int cr_y0_odd = 3 * cr00_sample + cr10_sample;
+				const int cr_y1_even = cr01_sample + 3 * cr11_sample;
+				const int cr_y1_odd = 3 * cr01_sample + cr11_sample;
+
+				const int cb0 = (v0 * cb_y0_odd + v1 * cb_y1_odd + 8) >> 4;
+				const int cr0 = (v0 * cr_y0_odd + v1 * cr_y1_odd + 8) >> 4;
+				const int cb1 = (v0 * cb_y0_even + v1 * cb_y1_even + 8) >> 4;
+				const int cr1 = (v0 * cr_y0_even + v1 * cr_y1_even + 8) >> 4;
+
+				const int x0 = 2 * c_x0 + 1;
+				const int x1 = x0 + 1;
+
+				int k = (x0 >> 4) * BLOCKS_PER_MCU * 64 + ((x0 & 8) ? 64 : 0) + (x0 & 7);
+				write_pixel(d0, p_YSamples[check_sample_buf_ofs(k + y_sample_base_ofs)], cb0, cr0);
+				d0 += m_dest_bytes_per_pixel;
+
+				if (x1 < m_image_x_size)
+				{
+					k = (x1 >> 4) * BLOCKS_PER_MCU * 64 + ((x1 & 8) ? 64 : 0) + (x1 & 7);
+					write_pixel(d0, p_YSamples[check_sample_buf_ofs(k + y_sample_base_ofs)], cb1, cr1);
+					d0 += m_dest_bytes_per_pixel;
+				}
 			}
 
 			return 1;
@@ -2155,6 +2464,14 @@ namespace jpgd {
 
 		if (m_total_lines_left == 0)
 			return JPGD_DONE;
+
+		if (m_pOutput_buffer)
+		{
+			const int y = m_image_y_size - m_total_lines_left;
+			uint8* pRow = m_pOutput_buffer + static_cast<size_t>(y) * m_real_dest_bytes_per_scan_line;
+			m_pScan_line_0 = pRow;
+			m_pScan_line_1 = (y + 1 < m_image_y_size) ? pRow + m_real_dest_bytes_per_scan_line : pRow;
+		}
 
 		const bool chroma_y_filtering = ((m_flags & cFlagBoxChromaFiltering) == 0) && ((m_scan_type == JPGD_YH2V2) || (m_scan_type == JPGD_YH1V2));
 
@@ -2320,9 +2637,7 @@ namespace jpgd {
 		}
 
 		memset(pH->look_up, 0, sizeof(pH->look_up));
-		memset(pH->look_up2, 0, sizeof(pH->look_up2));
 		memset(pH->tree, 0, sizeof(pH->tree));
-		memset(pH->code_size, 0, sizeof(pH->code_size));
 
 		nextfreeentry = -1;
 
@@ -2336,64 +2651,37 @@ namespace jpgd {
 			code_size = huffsize[p];
 
 			assert(i < JPGD_HUFF_CODE_SIZE_MAX_LENGTH);
-			pH->code_size[i] = static_cast<uint8>(code_size);
 
-			if (code_size <= 8)
+			if (code_size <= JPGD_HUFF_LOOKUP_BITS)
 			{
-				code <<= (8 - code_size);
+				code <<= (JPGD_HUFF_LOOKUP_BITS - code_size);
 
-				for (l = 1 << (8 - code_size); l > 0; l--)
+				for (l = 1 << (JPGD_HUFF_LOOKUP_BITS - code_size); l > 0; l--)
 				{
-					if (code >= 256)
+					if (code >= JPGD_HUFF_LOOKUP_SIZE)
 						stop_decoding(JPGD_DECODE_ERROR);
 
-					pH->look_up[code] = i;
-
-					bool has_extrabits = false;
-					int extra_bits = 0;
-					int num_extra_bits = i & 15;
-
-					int bits_to_fetch = code_size;
-					if (num_extra_bits)
-					{
-						int total_codesize = code_size + num_extra_bits;
-						if (total_codesize <= 8)
-						{
-							has_extrabits = true;
-							extra_bits = ((1 << num_extra_bits) - 1) & (code >> (8 - total_codesize));
-
-							if (extra_bits > 0x7FFF)
-								stop_decoding(JPGD_DECODE_ERROR);
-
-							bits_to_fetch += num_extra_bits;
-						}
-					}
-
-					if (!has_extrabits)
-						pH->look_up2[code] = i | (bits_to_fetch << 8);
-					else
-						pH->look_up2[code] = i | 0x8000 | (extra_bits << 16) | (bits_to_fetch << 8);
+					pH->look_up[code] = static_cast<int16>(i | (code_size << 8));
 
 					code++;
 				}
 			}
 			else
 			{
-				subtree = (code >> (code_size - 8)) & 0xFF;
+				subtree = (code >> (code_size - JPGD_HUFF_LOOKUP_BITS)) & (JPGD_HUFF_LOOKUP_SIZE - 1);
 
 				currententry = pH->look_up[subtree];
 
 				if (currententry == 0)
 				{
 					pH->look_up[subtree] = currententry = nextfreeentry;
-					pH->look_up2[subtree] = currententry = nextfreeentry;
 
 					nextfreeentry -= 2;
 				}
 
-				code <<= (16 - (code_size - 8));
+				code <<= (16 - (code_size - JPGD_HUFF_LOOKUP_BITS));
 
-				for (l = code_size; l > 9; l--)
+				for (l = code_size; l > JPGD_HUFF_LOOKUP_BITS + 1; l--)
 				{
 					if ((code & 0x8000) == 0)
 						currententry--;
@@ -2623,7 +2911,7 @@ namespace jpgd {
 		if (m_scan_type == JPGD_GRAYSCALE)
 			m_dest_bytes_per_pixel = 1;
 		else
-			m_dest_bytes_per_pixel = 4;
+			m_dest_bytes_per_pixel = (m_flags & cFlagRGB24) ? 3 : 4;
 
 		m_dest_bytes_per_scan_line = ((m_image_x_size + 15) & 0xFFF0) * m_dest_bytes_per_pixel;
 
@@ -3063,6 +3351,15 @@ namespace jpgd {
 		return JPGD_SUCCESS;
 	}
 
+	bool jpeg_decoder::set_output_buffer(uint8* pBuffer)
+	{
+		if ((!pBuffer) || (m_scan_type != JPGD_YH2V2) || (m_flags & cFlagBoxChromaFiltering))
+			return false;
+
+		m_pOutput_buffer = pBuffer;
+		return true;
+	}
+
 	jpeg_decoder::~jpeg_decoder()
 	{
 		free_all_blocks();
@@ -3179,7 +3476,8 @@ namespace jpgd {
 		if ((req_comps != 1) && (req_comps != 3) && (req_comps != 4))
 			return nullptr;
 
-		jpeg_decoder decoder(pStream, flags);
+		const uint32_t decoder_flags = flags | ((req_comps == 3) ? jpeg_decoder::cFlagRGB24 : 0);
+		jpeg_decoder decoder(pStream, decoder_flags);
 		if (decoder.get_error_code() != JPGD_SUCCESS)
 			return nullptr;
 
@@ -3197,9 +3495,12 @@ namespace jpgd {
 		if (!pImage_data)
 			return nullptr;
 
+		const bool direct_output = (req_comps == 3) && (decoder.get_num_components() == 3) &&
+			decoder.set_output_buffer(pImage_data);
+
 		for (int y = 0; y < image_height; y++)
 		{
-			const uint8* pScan_line;
+			const uint8* pScan_line = nullptr;
 			uint scan_line_len;
 			if (decoder.decode((const void**)&pScan_line, &scan_line_len) != JPGD_SUCCESS)
 			{
@@ -3207,9 +3508,14 @@ namespace jpgd {
 				return nullptr;
 			}
 
+			if (direct_output)
+				continue;
+
 			uint8* pDst = pImage_data + y * dst_bpl;
 
-			if (((req_comps == 1) && (decoder.get_num_components() == 1)) || ((req_comps == 4) && (decoder.get_num_components() == 3)))
+			if (((req_comps == 1) && (decoder.get_num_components() == 1)) ||
+				((req_comps == 3) && (decoder.get_num_components() == 3)) ||
+				((req_comps == 4) && (decoder.get_num_components() == 3)))
 				memcpy(pDst, pScan_line, dst_bpl);
 			else if (decoder.get_num_components() == 1)
 			{

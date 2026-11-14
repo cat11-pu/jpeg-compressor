@@ -20,6 +20,8 @@
 
 #define JPGD_HUFF_TREE_MAX_LENGTH 512
 #define JPGD_HUFF_CODE_SIZE_MAX_LENGTH 256
+#define JPGD_HUFF_LOOKUP_BITS 10
+#define JPGD_HUFF_LOOKUP_SIZE (1 << JPGD_HUFF_LOOKUP_BITS)
 
 namespace jpgd
 {
@@ -127,7 +129,8 @@ namespace jpgd
 		enum
 		{
 			cFlagBoxChromaFiltering = 1,
-			cFlagDisableSIMD = 2
+			cFlagDisableSIMD = 2,
+			cFlagRGB24 = 4
 		};
 
 		// Call get_error_code() after constructing to determine if the stream is valid or not. You may call the get_width(), get_height(), etc.
@@ -162,6 +165,8 @@ namespace jpgd
 		// Returns the total number of bytes actually consumed by the decoder (which should equal the actual size of the JPEG file).
 		inline int get_total_bytes_read() const { return m_total_bytes_read; }
 
+		bool set_output_buffer(uint8* pBuffer);
+
 	private:
 		jpeg_decoder(const jpeg_decoder&);
 		jpeg_decoder& operator =(const jpeg_decoder&);
@@ -171,10 +176,8 @@ namespace jpgd
 		struct huff_tables
 		{
 			bool ac_table;
-			uint  look_up[256];
-			uint  look_up2[256];
-			uint8 code_size[JPGD_HUFF_CODE_SIZE_MAX_LENGTH];
-			uint  tree[JPGD_HUFF_TREE_MAX_LENGTH];
+			int16 look_up[JPGD_HUFF_LOOKUP_SIZE];
+			int16 tree[JPGD_HUFF_TREE_MAX_LENGTH];
 		};
 
 		struct coeff_buf
@@ -267,6 +270,7 @@ namespace jpgd
 		int m_cbg[256];
 		uint8* m_pScan_line_0;
 		uint8* m_pScan_line_1;
+		uint8* m_pOutput_buffer;
 		jpgd_status m_error_code;
 		int m_total_bytes_read;
 
