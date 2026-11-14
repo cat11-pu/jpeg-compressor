@@ -150,6 +150,8 @@ namespace jpgd
 		int decode(const void** pScan_line, uint* pScan_line_len);
 
 		inline jpgd_status get_error_code() const { return m_error_code; }
+		inline int64_t get_error_offset() const { return m_error_offset; }
+		inline const char* get_error_message() const { return m_error_message; }
 
 		inline int get_width() const { return m_image_x_size; }
 		inline int get_height() const { return m_image_y_size; }
@@ -190,7 +192,7 @@ namespace jpgd
 			mem_block* m_pNext;
 			size_t m_used_count;
 			size_t m_size;
-			char m_data[1];
+			alignas(16) char m_data[1];
 		};
 
 		jmp_buf m_jmp_state;
@@ -268,6 +270,9 @@ namespace jpgd
 		uint8* m_pScan_line_0;
 		uint8* m_pScan_line_1;
 		jpgd_status m_error_code;
+		int64_t m_error_offset;
+		char m_error_message[128];
+		int64_t m_current_offset;
 		int m_total_bytes_read;
 
 		bool m_ready_flag;

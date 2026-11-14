@@ -30,6 +30,7 @@
 #include <string.h>
 #include <algorithm>
 #include <assert.h>
+#include <limits.h>
 
 #ifdef _MSC_VER
 #pragma warning (disable : 4611) // warning C4611: interaction between '_setjmp' and C++ object destruction is non-portable
@@ -59,6 +60,50 @@ namespace jpgd {
 
 	static inline void* jpgd_malloc(size_t nSize) { return malloc(nSize); }
 	static inline void jpgd_free(void* p) { free(p); }
+
+	static const char* jpgd_status_name(jpgd_status status)
+	{
+		switch (status)
+		{
+		case JPGD_SUCCESS: return "JPGD_SUCCESS";
+		case JPGD_FAILED: return "JPGD_FAILED";
+		case JPGD_DONE: return "JPGD_DONE";
+		case JPGD_BAD_DHT_COUNTS: return "JPGD_BAD_DHT_COUNTS";
+		case JPGD_BAD_DHT_INDEX: return "JPGD_BAD_DHT_INDEX";
+		case JPGD_BAD_DHT_MARKER: return "JPGD_BAD_DHT_MARKER";
+		case JPGD_BAD_DQT_MARKER: return "JPGD_BAD_DQT_MARKER";
+		case JPGD_BAD_DQT_TABLE: return "JPGD_BAD_DQT_TABLE";
+		case JPGD_BAD_PRECISION: return "JPGD_BAD_PRECISION";
+		case JPGD_BAD_HEIGHT: return "JPGD_BAD_HEIGHT";
+		case JPGD_BAD_WIDTH: return "JPGD_BAD_WIDTH";
+		case JPGD_TOO_MANY_COMPONENTS: return "JPGD_TOO_MANY_COMPONENTS";
+		case JPGD_BAD_SOF_LENGTH: return "JPGD_BAD_SOF_LENGTH";
+		case JPGD_BAD_VARIABLE_MARKER: return "JPGD_BAD_VARIABLE_MARKER";
+		case JPGD_BAD_DRI_LENGTH: return "JPGD_BAD_DRI_LENGTH";
+		case JPGD_BAD_SOS_LENGTH: return "JPGD_BAD_SOS_LENGTH";
+		case JPGD_BAD_SOS_COMP_ID: return "JPGD_BAD_SOS_COMP_ID";
+		case JPGD_W_EXTRA_BYTES_BEFORE_MARKER: return "JPGD_W_EXTRA_BYTES_BEFORE_MARKER";
+		case JPGD_NO_ARITHMITIC_SUPPORT: return "JPGD_NO_ARITHMITIC_SUPPORT";
+		case JPGD_UNEXPECTED_MARKER: return "JPGD_UNEXPECTED_MARKER";
+		case JPGD_NOT_JPEG: return "JPGD_NOT_JPEG";
+		case JPGD_UNSUPPORTED_MARKER: return "JPGD_UNSUPPORTED_MARKER";
+		case JPGD_BAD_DQT_LENGTH: return "JPGD_BAD_DQT_LENGTH";
+		case JPGD_TOO_MANY_BLOCKS: return "JPGD_TOO_MANY_BLOCKS";
+		case JPGD_UNDEFINED_QUANT_TABLE: return "JPGD_UNDEFINED_QUANT_TABLE";
+		case JPGD_UNDEFINED_HUFF_TABLE: return "JPGD_UNDEFINED_HUFF_TABLE";
+		case JPGD_NOT_SINGLE_SCAN: return "JPGD_NOT_SINGLE_SCAN";
+		case JPGD_UNSUPPORTED_COLORSPACE: return "JPGD_UNSUPPORTED_COLORSPACE";
+		case JPGD_UNSUPPORTED_SAMP_FACTORS: return "JPGD_UNSUPPORTED_SAMP_FACTORS";
+		case JPGD_DECODE_ERROR: return "JPGD_DECODE_ERROR";
+		case JPGD_BAD_RESTART_MARKER: return "JPGD_BAD_RESTART_MARKER";
+		case JPGD_BAD_SOS_SPECTRAL: return "JPGD_BAD_SOS_SPECTRAL";
+		case JPGD_BAD_SOS_SUCCESSIVE: return "JPGD_BAD_SOS_SUCCESSIVE";
+		case JPGD_STREAM_READ: return "JPGD_STREAM_READ";
+		case JPGD_NOTENOUGHMEM: return "JPGD_NOTENOUGHMEM";
+		case JPGD_TOO_MANY_SCANS: return "JPGD_TOO_MANY_SCANS";
+		default: return "JPGD_UNKNOWN";
+		}
+	}
 
 	// DCT coefficients are stored in this sequence.
 	static int g_ZAG[64] = { 0,1,8,16,9,2,3,10,17,24,32,25,18,11,4,5,12,19,26,33,40,48,41,34,27,20,13,6,7,14,21,28,35,42,49,56,57,50,43,36,29,22,15,23,30,37,44,51,58,59,52,45,38,31,39,46,53,60,61,54,47,55,62,63 };
@@ -384,6 +429,7 @@ namespace jpgd {
 
 		uint c = *m_pIn_buf_ofs++;
 		m_in_buf_left--;
+		m_current_offset++;
 
 		return c;
 	}
@@ -410,6 +456,7 @@ namespace jpgd {
 
 		uint c = *m_pIn_buf_ofs++;
 		m_in_buf_left--;
+		m_current_offset++;
 
 		return c;
 	}
@@ -420,6 +467,7 @@ namespace jpgd {
 		// This could write before the input buffer, but we've placed another array there.
 		*(--m_pIn_buf_ofs) = q;
 		m_in_buf_left++;
+		m_current_offset--;
 	}
 
 	// Retrieves one character from the input stream, but does not read past markers. Will continue to return 0xFF when a marker is encountered.
@@ -506,6 +554,7 @@ namespace jpgd {
 				m_bit_buf |= ((uint)m_pIn_buf_ofs[0] << 8) | m_pIn_buf_ofs[1];
 				m_in_buf_left -= 2;
 				m_pIn_buf_ofs += 2;
+				m_current_offset += 2;
 			}
 
 			m_bit_buf <<= -m_bits_left;
@@ -639,13 +688,17 @@ namespace jpgd {
 	JPGD_NORETURN void jpeg_decoder::stop_decoding(jpgd_status status)
 	{
 		m_error_code = status;
+		m_error_offset = m_current_offset;
+		snprintf(m_error_message, sizeof(m_error_message), "%s at byte offset %lld", jpgd_status_name(status), static_cast<long long>(m_error_offset));
 		free_all_blocks();
 		longjmp(m_jmp_state, status);
 	}
 		
 	void* jpeg_decoder::alloc(size_t nSize, bool zero)
 	{
-		nSize = (JPGD_MAX(nSize, 1) + 3) & ~3;
+		if (nSize > (SIZE_MAX - 15))
+			stop_decoding(JPGD_NOTENOUGHMEM);
+		nSize = (JPGD_MAX(nSize, 1) + 15) & ~static_cast<size_t>(15);
 		char* rv = nullptr;
 		for (mem_block* b = m_pMem_blocks; b; b = b->m_pNext)
 		{
@@ -951,6 +1004,10 @@ namespace jpgd {
 			if (ci >= JPGD_MAX_COMPONENTS)
 				stop_decoding(JPGD_DECODE_ERROR);
 
+			for (int prior = 0; prior < i; prior++)
+				if (m_comp_list[prior] == ci)
+					stop_decoding(JPGD_BAD_SOS_COMP_ID);
+
 			m_comp_list[i] = ci;
 
 			m_comp_dc_tab[ci] = (c >> 4) & 15;
@@ -1187,6 +1244,9 @@ namespace jpgd {
 		m_flags = flags;
 		m_pMem_blocks = nullptr;
 		m_error_code = JPGD_SUCCESS;
+		m_error_offset = 0;
+		m_error_message[0] = '\0';
+		m_current_offset = 0;
 		m_ready_flag = false;
 		m_image_x_size = m_image_y_size = 0;
 		m_pStream = pStream;
@@ -1343,6 +1403,12 @@ namespace jpgd {
 
 		for (int mcu_block = 0; mcu_block < m_blocks_per_mcu; mcu_block++)
 		{
+			for (int i = 0; i < 64; i++)
+			{
+				const int coefficient = pSrc_ptr[i];
+				if ((coefficient < -2047) || (coefficient > 2047))
+					stop_decoding(JPGD_DECODE_ERROR);
+			}
 			idct(pSrc_ptr, pDst_ptr, m_mcu_block_max_zag[mcu_block], ((m_flags & cFlagDisableSIMD) == 0) && m_has_sse2);
 			pSrc_ptr += 64;
 			pDst_ptr += 64;
@@ -1669,7 +1735,7 @@ namespace jpgd {
 		int row = m_max_mcu_y_size - m_mcu_lines_left;
 		uint8* d0 = m_pScan_line_0;
 
-		const int half_image_x_size = (m_image_x_size >> 1) - 1;
+		const int half_image_x_size = JPGD_MAX((m_image_x_size >> 1) - 1, 0);
 		const int row_x8 = row * 8;
 
 		for (int x = 0; x < m_image_x_size; x++)
@@ -1762,7 +1828,7 @@ namespace jpgd {
 		int y = m_image_y_size - m_total_lines_left;
 		int row = y & 15;
 
-		const int half_image_y_size = (m_image_y_size >> 1) - 1;
+		const int half_image_y_size = JPGD_MAX((m_image_y_size >> 1) - 1, 0);
 
 		uint8* d0 = m_pScan_line_0;
 
@@ -1891,7 +1957,7 @@ namespace jpgd {
 		int y = m_image_y_size - m_total_lines_left;
 		int row = y & 15;
 
-		const int half_image_y_size = (m_image_y_size >> 1) - 1;
+		const int half_image_y_size = JPGD_MAX((m_image_y_size >> 1) - 1, 0);
 
 		uint8* d0 = m_pScan_line_0;
 
@@ -1915,7 +1981,7 @@ namespace jpgd {
 		const int y0_base = (c_y0 & 7) * 8 + 256;
 		const int y1_base = (c_y1 & 7) * 8 + 256;
 
-		const int half_image_x_size = (m_image_x_size >> 1) - 1;
+		const int half_image_x_size = JPGD_MAX((m_image_x_size >> 1) - 1, 0);
 
 		static const uint8_t s_muls[2][2][4] =
 		{
@@ -2514,7 +2580,11 @@ namespace jpgd {
 				num_blocks = m_comp_h_samp[component_id] * m_comp_v_samp[component_id];
 
 				while (num_blocks--)
+				{
+					if (m_blocks_per_mcu >= JPGD_MAX_BLOCKS_PER_MCU)
+						return false;
 					m_mcu_org[m_blocks_per_mcu++] = component_id;
+				}
 			}
 		}
 
@@ -2664,12 +2734,18 @@ namespace jpgd {
 	{
 		coeff_buf* cb = (coeff_buf*)alloc(sizeof(coeff_buf));
 
+		if ((block_num_x < 1) || (block_num_y < 1))
+			stop_decoding(JPGD_DECODE_ERROR);
+
 		cb->block_num_x = block_num_x;
 		cb->block_num_y = block_num_y;
 		cb->block_len_x = block_len_x;
 		cb->block_len_y = block_len_y;
 		cb->block_size = (block_len_x * block_len_y) * sizeof(jpgd_block_coeff_t);
-		cb->pData = (uint8*)alloc(cb->block_size * block_num_x * block_num_y, true);
+		const size_t block_count = static_cast<size_t>(block_num_x) * static_cast<size_t>(block_num_y);
+		if (block_count > (SIZE_MAX / static_cast<size_t>(cb->block_size)))
+			stop_decoding(JPGD_TOO_MANY_BLOCKS);
+		cb->pData = (uint8*)alloc(static_cast<size_t>(cb->block_size) * block_count, true);
 		return cb;
 	}
 
@@ -2699,7 +2775,7 @@ namespace jpgd {
 
 		pD->m_last_dc_val[component_id] = (s += pD->m_last_dc_val[component_id]);
 
-		p[0] = static_cast<jpgd_block_coeff_t>(s << pD->m_successive_low);
+		p[0] = static_cast<jpgd_block_coeff_t>(left_shifti(s, pD->m_successive_low));
 	}
 
 	void jpeg_decoder::decode_block_dc_refine(jpeg_decoder* pD, int component_id, int block_x, int block_y)
@@ -2743,7 +2819,7 @@ namespace jpgd {
 				r = pD->get_bits_no_markers(s);
 				s = JPGD_HUFF_EXTEND(r, s);
 
-				p[g_ZAG[k]] = static_cast<jpgd_block_coeff_t>(s << pD->m_successive_low);
+				p[g_ZAG[k]] = static_cast<jpgd_block_coeff_t>(left_shifti(s, pD->m_successive_low));
 			}
 			else
 			{
@@ -3191,9 +3267,14 @@ namespace jpgd {
 		if (decoder.begin_decoding() != JPGD_SUCCESS)
 			return nullptr;
 
-		const int dst_bpl = image_width * req_comps;
+		const size_t dst_bpl = static_cast<size_t>(image_width) * static_cast<size_t>(req_comps);
+		if (static_cast<size_t>(image_height) > (SIZE_MAX / dst_bpl))
+			return nullptr;
+		const size_t dst_size = dst_bpl * static_cast<size_t>(image_height);
+		if (dst_size > static_cast<size_t>(INT_MAX))
+			return nullptr;
 
-		uint8* pImage_data = (uint8*)jpgd_malloc(dst_bpl * image_height);
+		uint8* pImage_data = (uint8*)jpgd_malloc(dst_size);
 		if (!pImage_data)
 			return nullptr;
 
@@ -3207,7 +3288,7 @@ namespace jpgd {
 				return nullptr;
 			}
 
-			uint8* pDst = pImage_data + y * dst_bpl;
+			uint8* pDst = pImage_data + static_cast<size_t>(y) * dst_bpl;
 
 			if (((req_comps == 1) && (decoder.get_num_components() == 1)) || ((req_comps == 4) && (decoder.get_num_components() == 3)))
 				memcpy(pDst, pScan_line, dst_bpl);
@@ -3268,6 +3349,8 @@ namespace jpgd {
 
 	unsigned char* decompress_jpeg_image_from_memory(const unsigned char* pSrc_data, int src_data_size, int* width, int* height, int* actual_comps, int req_comps, uint32_t flags)
 	{
+		if ((!pSrc_data) || (src_data_size < 0))
+			return nullptr;
 		jpgd::jpeg_decoder_mem_stream mem_stream(pSrc_data, src_data_size);
 		return decompress_jpeg_image_from_stream(&mem_stream, width, height, actual_comps, req_comps, flags);
 	}
