@@ -37,6 +37,20 @@ namespace jpgd
 	unsigned char* decompress_jpeg_image_from_memory(const unsigned char* pSrc_data, int src_data_size, int* width, int* height, int* actual_comps, int req_comps, uint32_t flags = 0);
 	unsigned char* decompress_jpeg_image_from_file(const char* pSrc_filename, int* width, int* height, int* actual_comps, int req_comps, uint32_t flags = 0);
 
+	// Reduced-size decoding. downscale_denom may be 2, 4, or 8.
+	// This is JPEG-domain low-pass decoding (a reduced-size IDCT), equivalent in spirit to
+	// libjpeg's scale_denom. It is fast and memory efficient, but it is not bit-exact with
+	// decoding at full resolution and then applying an arbitrary spatial-domain resize.
+	unsigned char* decompress_jpeg_image_scaled_from_memory(const unsigned char* pSrc_data, int src_data_size, int downscale_denom, int* width, int* height, int* actual_comps, int req_comps, uint32_t flags = 0);
+	unsigned char* decompress_jpeg_image_scaled_from_file(const char* pSrc_filename, int downscale_denom, int* width, int* height, int* actual_comps, int req_comps, uint32_t flags = 0);
+
+	// Exact integer box downsampling. The output is byte-for-byte identical to
+	// decoding at full resolution with req_comps and then averaging each NxN block.
+	// (The final output row/column averages the clipped edge block.) STREAMING accumulation
+	// is used, so no full-resolution RGB(A) allocation is required.
+	unsigned char* decompress_jpeg_image_box_downsampled_from_memory(const unsigned char* pSrc_data, int src_data_size, int downscale_denom, int* width, int* height, int* actual_comps, int req_comps, uint32_t flags = 0);
+	unsigned char* decompress_jpeg_image_box_downsampled_from_file(const char* pSrc_filename, int downscale_denom, int* width, int* height, int* actual_comps, int req_comps, uint32_t flags = 0);
+
 	// Success/failure error codes.
 	enum jpgd_status
 	{
@@ -130,6 +144,14 @@ namespace jpgd
 			cFlagDisableSIMD = 2
 		};
 
+		enum jpeg_downsample
+		{
+			cDownsampleNone = 1,
+			cDownsample1_2 = 2,
+			cDownsample1_4 = 4,
+			cDownsample1_8 = 8
+		};
+
 		// Call get_error_code() after constructing to determine if the stream is valid or not. You may call the get_width(), get_height(), etc.
 		// methods after the constructor is called. You may then either destruct the object, or begin decoding the image by calling begin_decoding(), then decode() on each scanline.
 		jpeg_decoder(jpeg_decoder_stream* pStream, uint32_t flags = 0);
@@ -140,6 +162,10 @@ namespace jpgd
 		// If JPGD_SUCCESS is returned you may then call decode() on each scanline.
 
 		int begin_decoding();
+
+		// Must be called before begin_decoding(). A denominator of 1 means full size.
+		int set_downsample_factor(int downscale_denom);
+		inline int get_downsample_factor() const { return m_scale_denom; }
 
 		// Returns the next scan line.
 		// For grayscale images, pScan_line will point to a buffer containing 8-bit pixels (get_bytes_per_pixel() will return 1). 
@@ -153,11 +179,13 @@ namespace jpgd
 
 		inline int get_width() const { return m_image_x_size; }
 		inline int get_height() const { return m_image_y_size; }
+		inline int get_output_width() const { return m_scale_denom > 1 ? ((m_image_x_size + m_scale_denom - 1) / m_scale_denom) : m_image_x_size; }
+		inline int get_output_height() const { return m_scale_denom > 1 ? ((m_image_y_size + m_scale_denom - 1) / m_scale_denom) : m_image_y_size; }
 
 		inline int get_num_components() const { return m_comps_in_frame; }
 
 		inline int get_bytes_per_pixel() const { return m_dest_bytes_per_pixel; }
-		inline int get_bytes_per_scan_line() const { return m_image_x_size * get_bytes_per_pixel(); }
+		inline int get_bytes_per_scan_line() const { return get_output_width() * get_bytes_per_pixel(); }
 
 		// Returns the total number of bytes actually consumed by the decoder (which should equal the actual size of the JPEG file).
 		inline int get_total_bytes_read() const { return m_total_bytes_read; }
@@ -198,6 +226,13 @@ namespace jpgd
 		mem_block* m_pMem_blocks;
 		int m_image_x_size;
 		int m_image_y_size;
+		int m_output_x_size;
+		int m_output_y_size;
+		int m_scale_denom;
+		int m_scale_block_dim;
+		int m_scale_block_size;
+		int m_scale_mcu_x_size;
+		int m_scale_mcu_y_size;
 		jpeg_decoder_stream* m_pStream;
 
 		int m_progressive_flag;
@@ -275,7 +310,7 @@ namespace jpgd
 		bool m_sample_buf_prev_valid;
 		bool m_has_sse2;
 
-		inline int check_sample_buf_ofs(int ofs) const { assert(ofs >= 0); assert(ofs < m_max_blocks_per_row * 64); return ofs; }
+		inline int check_sample_buf_ofs(int ofs) const { assert(ofs >= 0); assert(ofs < m_max_blocks_per_row * m_scale_block_size); return ofs; }
 		void free_all_blocks();
 		JPGD_NORETURN void stop_decoding(jpgd_status status);
 		void* alloc(size_t n, bool zero = false);
@@ -297,6 +332,14 @@ namespace jpgd
 		void create_look_ups();
 		void fix_in_buffer();
 		void transform_mcu(int mcu_row);
+		static void idct_scaled(const jpgd_block_coeff_t* pSrc_ptr, uint8* pDst_ptr, int block_size);
+		void scaled_convert();
+		void H1V1ConvertScaled();
+		void H2V1ConvertScaled();
+		void H1V2ConvertScaled();
+		void H2V2ConvertScaled();
+		void gray_convert_scaled();
+		inline void ycc_to_rgba(uint8* d, int y, int cb, int cr) const;
 		coeff_buf* coeff_buf_open(int block_num_x, int block_num_y, int block_len_x, int block_len_y);
 		inline jpgd_block_coeff_t* coeff_buf_getp(coeff_buf* cb, int block_x, int block_y);
 		void load_next_row();

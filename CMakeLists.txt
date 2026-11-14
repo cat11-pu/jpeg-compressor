@@ -1,6 +1,6 @@
-project(jpge)
+cmake_minimum_required(VERSION 3.10)
 
-cmake_minimum_required(VERSION 3.0)
+project(jpge)
 option(BUILD_X64 "build 64-bit" TRUE)
 option(STATIC "static linking" FALSE)
 
@@ -61,5 +61,10 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/${BIN_DIRECTORY})
 
 add_executable(jpge ${BASISU_SRC_LIST})
 
-install(TARGETS jpge DESTINATION bin)
+add_executable(jpgd_downsample_bench
+	tools/downsample_bench.cpp
+	jpgd.cpp
+	)
+target_include_directories(jpgd_downsample_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
+install(TARGETS jpge DESTINATION bin)

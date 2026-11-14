@@ -47,6 +47,46 @@ unsigned char *decompress_jpeg_image_from_file(const char *pSrc_filename, int *w
 ```
 Just like the compressor, for more control you can directly utilize the jpgd::jpeg_decompressor class, or call the decompress_jpeg_image_from_stream() function.
 
+### Reduced-size and downsampled decoding
+
+Two reduced-size APIs are available:
+
+``` cpp
+// Fast JPEG-domain low-pass decode (reduced-size IDCT): 1/2, 1/4, or 1/8 size.
+// This is the fastest option and uses the least memory, but its pixels are not
+// guaranteed to match a full decode followed by an arbitrary spatial resize.
+unsigned char *decompress_jpeg_image_scaled_from_memory(
+    const unsigned char *pSrc_data, int src_data_size, int downscale_denom,
+    int *width, int *height, int *actual_comps, int req_comps, uint32_t flags = 0);
+
+// Exact integer NxN box downsample. The result is byte-for-byte identical to
+// decoding at full size and then averaging each NxN block, including clipped
+// edge blocks. It streams full scanlines and never allocates a full RGB(A) image.
+unsigned char *decompress_jpeg_image_box_downsampled_from_memory(
+    const unsigned char *pSrc_data, int src_data_size, int downscale_denom,
+    int *width, int *height, int *actual_comps, int req_comps, uint32_t flags = 0);
+```
+
+`downscale_denom` must be 2, 4, or 8. The output dimensions are
+`ceil(source_width / downscale_denom)` by
+`ceil(source_height / downscale_denom)`. File variants and low-level
+`jpeg_decoder::set_downsample_factor()` are also provided.
+
+Important: reduced-size IDCT is not algebraically identical to decoding at full
+resolution and then applying an arbitrary spatial filter. IDCT rounding and
+per-pixel clipping make that impossible in general. Use
+`decompress_jpeg_image_scaled_*` when speed/memory matter most, and
+`decompress_jpeg_image_box_downsampled_*` when bit-exact box-filter output is
+required.
+
+Run the included comparison benchmark with:
+
+``` sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+bin/jpgd_downsample_bench image.jpg --comps 4 --repeat 7
+```
+
 The optional flags are: 
 
 `cFlagBoxChromaFiltering`: Uses much faster box filtering on the chroma components, but may lead to artifacts on some images

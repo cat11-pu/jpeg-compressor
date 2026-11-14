@@ -95,6 +95,17 @@ namespace jpgd {
 #define FIX_2_562915447  ((int32)20995)       /* FIX(2.562915447) */
 #define FIX_3_072711026  ((int32)25172)       /* FIX(3.072711026) */
 
+#define FIX_0_211164243  ((int32)1730)        /* FIX(0.211164243) */
+#define FIX_0_509795579  ((int32)4176)        /* FIX(0.509795579) */
+#define FIX_0_601344887  ((int32)4926)        /* FIX(0.601344887) */
+#define FIX_0_720959822  ((int32)5906)        /* FIX(0.720959822) */
+#define FIX_0_850430095  ((int32)6967)        /* FIX(0.850430095) */
+#define FIX_1_061594337  ((int32)8697)        /* FIX(1.061594337) */
+#define FIX_1_272758580  ((int32)10426)       /* FIX(1.272758580) */
+#define FIX_1_451774981  ((int32)11893)       /* FIX(1.451774981) */
+#define FIX_2_172734803  ((int32)17799)       /* FIX(2.172734803) */
+#define FIX_3_624509785  ((int32)29692)       /* FIX(3.624509785) */
+
 #define DESCALE(x,n)  (((x) + (SCALEDONE << ((n)-1))) >> (n))
 #define DESCALE_ZEROSHIFT(x,n)  (((x) + (128 << (n)) + (SCALEDONE << ((n)-1))) >> (n))
 
@@ -358,6 +369,132 @@ namespace jpgd {
 
 			pTemp++;
 			pDst_ptr++;
+		}
+	}
+
+	// Reduced-size IDCTs, derived from the IJG integer IDCT. pSrc_ptr is already
+	// dequantized. block_size is 1 (1x1), 2 (2x2), or 4 (4x4).
+	void jpeg_decoder::idct_scaled(const jpgd_block_coeff_t* pSrc_ptr, uint8* pDst_ptr, int block_size)
+	{
+		if (block_size == 1)
+		{
+			int dcval = (pSrc_ptr[0] + 4) >> 3;
+			*pDst_ptr = (uint8)CLAMP(dcval + 128);
+			return;
+		}
+
+		int workspace[8 * 4];
+
+		if (block_size == 2)
+		{
+			for (int c = 0; c < 8; c++)
+			{
+				if ((c == 2) || (c == 4) || (c == 6))
+					continue;
+
+				const jpgd_block_coeff_t* inptr = pSrc_ptr + c;
+				int* wsptr = workspace + c;
+
+				const int z1_dc = inptr[8 * 0];
+				const int tmp10 = left_shifti(z1_dc, CONST_BITS + 2);
+
+				const int z7 = inptr[8 * 7];
+				const int z5 = inptr[8 * 5];
+				const int z3 = inptr[8 * 3];
+				const int z1 = inptr[8 * 1];
+
+				int tmp0 = MULTIPLY(z7, -FIX_0_720959822);
+				tmp0 += MULTIPLY(z5, FIX_0_850430095);
+				tmp0 += MULTIPLY(z3, -FIX_1_272758580);
+				tmp0 += MULTIPLY(z1, FIX_3_624509785);
+
+				wsptr[8 * 0] = DESCALE(tmp10 + tmp0, CONST_BITS - PASS1_BITS + 2);
+				wsptr[8 * 1] = DESCALE(tmp10 - tmp0, CONST_BITS - PASS1_BITS + 2);
+			}
+
+			for (int r = 0; r < 2; r++)
+			{
+				const int* wsptr = workspace + r * 8;
+				const int tmp10 = left_shifti(wsptr[0], CONST_BITS + 2);
+
+				int tmp0 = MULTIPLY(wsptr[7], -FIX_0_720959822);
+				tmp0 += MULTIPLY(wsptr[5], FIX_0_850430095);
+				tmp0 += MULTIPLY(wsptr[3], -FIX_1_272758580);
+				tmp0 += MULTIPLY(wsptr[1], FIX_3_624509785);
+
+				pDst_ptr[0] = (uint8)CLAMP(DESCALE(tmp10 + tmp0, CONST_BITS + PASS1_BITS + 3 + 2) + 128);
+				pDst_ptr[1] = (uint8)CLAMP(DESCALE(tmp10 - tmp0, CONST_BITS + PASS1_BITS + 3 + 2) + 128);
+				pDst_ptr += 2;
+			}
+			return;
+		}
+
+		for (int c = 0; c < 8; c++)
+		{
+			if (c == 4)
+				continue;
+
+			const jpgd_block_coeff_t* inptr = pSrc_ptr + c;
+			int* wsptr = workspace + c;
+
+			int tmp0 = left_shifti(inptr[8 * 0], CONST_BITS + 1);
+			const int z2 = inptr[8 * 2];
+			const int z3 = inptr[8 * 6];
+			const int tmp2 = MULTIPLY(z2, FIX_1_847759065) + MULTIPLY(z3, -FIX_0_765366865);
+			const int tmp10 = tmp0 + tmp2;
+			const int tmp12 = tmp0 - tmp2;
+
+			const int z7 = inptr[8 * 7];
+			const int z5 = inptr[8 * 5];
+			const int z3v = inptr[8 * 3];
+			const int z1v = inptr[8 * 1];
+
+			tmp0 = MULTIPLY(z7, -FIX_0_211164243);
+			tmp0 += MULTIPLY(z5, FIX_1_451774981);
+			tmp0 += MULTIPLY(z3v, -FIX_2_172734803);
+			tmp0 += MULTIPLY(z1v, FIX_1_061594337);
+
+			const int tmp2b = MULTIPLY(z7, -FIX_0_509795579);
+			const int tmp2c = tmp2b +
+				MULTIPLY(z5, -FIX_0_601344887) +
+				MULTIPLY(z3v, FIX_0_899976223) +
+				MULTIPLY(z1v, FIX_2_562915447);
+
+			wsptr[8 * 0] = DESCALE(tmp10 + tmp2c, CONST_BITS - PASS1_BITS + 1);
+			wsptr[8 * 3] = DESCALE(tmp10 - tmp2c, CONST_BITS - PASS1_BITS + 1);
+			wsptr[8 * 1] = DESCALE(tmp12 + tmp0, CONST_BITS - PASS1_BITS + 1);
+			wsptr[8 * 2] = DESCALE(tmp12 - tmp0, CONST_BITS - PASS1_BITS + 1);
+		}
+
+		for (int r = 0; r < 4; r++)
+		{
+			const int* wsptr = workspace + r * 8;
+
+			const int tmp0 = left_shifti(wsptr[0], CONST_BITS + 1);
+			const int tmp2 = MULTIPLY(wsptr[2], FIX_1_847759065) + MULTIPLY(wsptr[6], -FIX_0_765366865);
+			const int tmp10 = tmp0 + tmp2;
+			const int tmp12 = tmp0 - tmp2;
+
+			const int z7 = wsptr[7];
+			const int z5 = wsptr[5];
+			const int z3 = wsptr[3];
+			const int z1 = wsptr[1];
+
+			int tmp0b = MULTIPLY(z7, -FIX_0_211164243);
+			tmp0b += MULTIPLY(z5, FIX_1_451774981);
+			tmp0b += MULTIPLY(z3, -FIX_2_172734803);
+			tmp0b += MULTIPLY(z1, FIX_1_061594337);
+
+			int tmp2b = MULTIPLY(z7, -FIX_0_509795579);
+			tmp2b += MULTIPLY(z5, -FIX_0_601344887);
+			tmp2b += MULTIPLY(z3, FIX_0_899976223);
+			tmp2b += MULTIPLY(z1, FIX_2_562915447);
+
+			pDst_ptr[0] = (uint8)CLAMP(DESCALE(tmp10 + tmp2b, CONST_BITS + PASS1_BITS + 3 + 1) + 128);
+			pDst_ptr[3] = (uint8)CLAMP(DESCALE(tmp10 - tmp2b, CONST_BITS + PASS1_BITS + 3 + 1) + 128);
+			pDst_ptr[1] = (uint8)CLAMP(DESCALE(tmp12 + tmp0b, CONST_BITS + PASS1_BITS + 3 + 1) + 128);
+			pDst_ptr[2] = (uint8)CLAMP(DESCALE(tmp12 - tmp0b, CONST_BITS + PASS1_BITS + 3 + 1) + 128);
+			pDst_ptr += 4;
 		}
 	}
 
@@ -1189,6 +1326,12 @@ namespace jpgd {
 		m_error_code = JPGD_SUCCESS;
 		m_ready_flag = false;
 		m_image_x_size = m_image_y_size = 0;
+		m_output_x_size = m_output_y_size = 0;
+		m_scale_denom = 1;
+		m_scale_block_dim = 8;
+		m_scale_block_size = 64;
+		m_scale_mcu_x_size = 0;
+		m_scale_mcu_y_size = 0;
 		m_pStream = pStream;
 		m_progressive_flag = JPGD_FALSE;
 				
@@ -1339,13 +1482,16 @@ namespace jpgd {
 		if (mcu_row * m_blocks_per_mcu >= m_max_blocks_per_row)
 			stop_decoding(JPGD_DECODE_ERROR);
 
-		uint8* pDst_ptr = m_pSample_buf + mcu_row * m_blocks_per_mcu * 64;
+		uint8* pDst_ptr = m_pSample_buf + mcu_row * m_blocks_per_mcu * m_scale_block_size;
 
 		for (int mcu_block = 0; mcu_block < m_blocks_per_mcu; mcu_block++)
 		{
-			idct(pSrc_ptr, pDst_ptr, m_mcu_block_max_zag[mcu_block], ((m_flags & cFlagDisableSIMD) == 0) && m_has_sse2);
+			if (m_scale_denom > 1)
+				idct_scaled(pSrc_ptr, pDst_ptr, m_scale_block_dim);
+			else
+				idct(pSrc_ptr, pDst_ptr, m_mcu_block_max_zag[mcu_block], ((m_flags & cFlagDisableSIMD) == 0) && m_has_sse2);
 			pSrc_ptr += 64;
-			pDst_ptr += 64;
+			pDst_ptr += m_scale_block_size;
 		}
 	}
 
@@ -1505,6 +1651,50 @@ namespace jpgd {
 
 				p[0] = static_cast<jpgd_block_coeff_t>(s * q[0]);
 
+				if (m_scale_denom == 8)
+				{
+					// 1x1 output needs only DC. AC symbols still have to be consumed
+					// to advance the entropy stream, but their coefficients are unused.
+					huff_tables* pH = m_pHuff_tabs[m_comp_ac_tab[component_id]];
+					int k;
+					for (k = 1; k < 64; k++)
+					{
+						int extra_bits;
+						s = huff_decode(pH, extra_bits);
+						r = s >> 4;
+						s &= 15;
+
+						if (s)
+						{
+							if (r)
+							{
+								if ((k + r) > 63)
+									stop_decoding(JPGD_DECODE_ERROR);
+								k += r;
+							}
+
+							s = JPGD_HUFF_EXTEND(extra_bits, s);
+							if (k >= 64)
+								stop_decoding(JPGD_DECODE_ERROR);
+						}
+						else
+						{
+							if (r == 15)
+							{
+								if ((k + 16) > 64)
+									stop_decoding(JPGD_DECODE_ERROR);
+								k += 15;
+							}
+							else
+								break;
+						}
+					}
+
+					m_mcu_block_max_zag[mcu_block] = 1;
+					row_block++;
+					continue;
+				}
+
 				int prev_num_set = m_mcu_block_max_zag[mcu_block];
 
 				huff_tables* pH = m_pHuff_tabs[m_comp_ac_tab[component_id]];
@@ -1587,6 +1777,144 @@ namespace jpgd {
 			transform_mcu(mcu_row);
 
 			m_restarts_left--;
+		}
+	}
+
+	// YCbCr H1V1 (1x1:1:1, 3 m_blocks per MCU) to RGB
+	inline void jpeg_decoder::ycc_to_rgba(uint8* d, int y, int cb, int cr) const
+	{
+		d[0] = clamp(y + m_crr[cr]);
+		d[1] = clamp(y + ((m_crg[cr] + m_cbg[cb]) >> 16));
+		d[2] = clamp(y + m_cbb[cb]);
+		d[3] = 255;
+	}
+
+	// Reduced-size chroma upsampling uses nearest-neighbour replication. The luma block
+	// size is already 8/denom; chroma needs exactly 2x replication for 4:2:x modes.
+	void jpeg_decoder::H2V2ConvertScaled()
+	{
+		const int n = m_scale_block_dim;
+		const int bs = m_scale_block_size;
+		const int row = m_scale_mcu_y_size - m_mcu_lines_left;
+		uint8* d = m_pScan_line_0;
+
+		for (int mcu = 0; mcu < m_max_mcus_per_row; mcu++)
+		{
+			const uint8* blocks = m_pSample_buf + mcu * 6 * bs;
+			const uint8* cb = blocks + 4 * bs;
+			const uint8* cr = blocks + 5 * bs;
+			const int y_block_row = (row >= n) ? 2 : 0;
+			const int y_row = row % n;
+			const int c_row = row >> 1;
+
+			for (int x = 0; x < 2 * n; x++)
+			{
+				const int y_block = y_block_row + ((x >= n) ? 1 : 0);
+				const int y = blocks[y_block * bs + y_row * n + (x % n)];
+				const int c_col = x >> 1;
+				ycc_to_rgba(d, y, cb[c_row * n + c_col], cr[c_row * n + c_col]);
+				d += 4;
+			}
+		}
+	}
+
+	void jpeg_decoder::H2V1ConvertScaled()
+	{
+		const int n = m_scale_block_dim;
+		const int bs = m_scale_block_size;
+		const int row = m_scale_mcu_y_size - m_mcu_lines_left;
+		uint8* d = m_pScan_line_0;
+
+		for (int mcu = 0; mcu < m_max_mcus_per_row; mcu++)
+		{
+			const uint8* blocks = m_pSample_buf + mcu * 4 * bs;
+			const uint8* cb = blocks + 2 * bs;
+			const uint8* cr = blocks + 3 * bs;
+
+			for (int x = 0; x < 2 * n; x++)
+			{
+				const int y_block = (x >= n) ? 1 : 0;
+				const int y = blocks[y_block * bs + row * n + (x % n)];
+				const int c_col = x >> 1;
+				ycc_to_rgba(d, y, cb[row * n + c_col], cr[row * n + c_col]);
+				d += 4;
+			}
+		}
+	}
+
+	void jpeg_decoder::H1V2ConvertScaled()
+	{
+		const int n = m_scale_block_dim;
+		const int bs = m_scale_block_size;
+		const int row = m_scale_mcu_y_size - m_mcu_lines_left;
+		uint8* d = m_pScan_line_0;
+
+		for (int mcu = 0; mcu < m_max_mcus_per_row; mcu++)
+		{
+			const uint8* blocks = m_pSample_buf + mcu * 4 * bs;
+			const uint8* cb = blocks + 2 * bs;
+			const uint8* cr = blocks + 3 * bs;
+			const int y_block = (row >= n) ? 1 : 0;
+			const int y_row = row % n;
+			const int c_row = row >> 1;
+
+			for (int x = 0; x < n; x++)
+			{
+				const int y = blocks[y_block * bs + y_row * n + x];
+				ycc_to_rgba(d, y, cb[c_row * n + x], cr[c_row * n + x]);
+				d += 4;
+			}
+		}
+	}
+
+	void jpeg_decoder::H1V1ConvertScaled()
+	{
+		const int n = m_scale_block_dim;
+		const int bs = m_scale_block_size;
+		const int row = m_scale_mcu_y_size - m_mcu_lines_left;
+		uint8* d = m_pScan_line_0;
+
+		for (int mcu = 0; mcu < m_max_mcus_per_row; mcu++)
+		{
+			const uint8* blocks = m_pSample_buf + mcu * 3 * bs;
+			const uint8* cb = blocks + bs;
+			const uint8* cr = blocks + 2 * bs;
+
+			for (int x = 0; x < n; x++)
+			{
+				const int y = blocks[row * n + x];
+				ycc_to_rgba(d, y, cb[row * n + x], cr[row * n + x]);
+				d += 4;
+			}
+		}
+	}
+
+	void jpeg_decoder::gray_convert_scaled()
+	{
+		const int n = m_scale_block_dim;
+		const int bs = m_scale_block_size;
+		const int row = m_scale_mcu_y_size - m_mcu_lines_left;
+		uint8* d = m_pScan_line_0;
+
+		for (int mcu = 0; mcu < m_max_mcus_per_row; mcu++)
+		{
+			const uint8* s = m_pSample_buf + mcu * bs + row * n;
+			for (int x = 0; x < n; x++)
+				d[x] = s[x];
+			d += n;
+		}
+	}
+
+	void jpeg_decoder::scaled_convert()
+	{
+		switch (m_scan_type)
+		{
+		case JPGD_YH2V2: H2V2ConvertScaled(); break;
+		case JPGD_YH2V1: H2V1ConvertScaled(); break;
+		case JPGD_YH1V2: H1V2ConvertScaled(); break;
+		case JPGD_YH1V1: H1V1ConvertScaled(); break;
+		case JPGD_GRAYSCALE: gray_convert_scaled(); break;
+		default: break;
 		}
 	}
 
@@ -2127,7 +2455,7 @@ namespace jpgd {
 		if (::setjmp(m_jmp_state))
 			return JPGD_FAILED;
 
-		const bool chroma_y_filtering = ((m_flags & cFlagBoxChromaFiltering) == 0) && ((m_scan_type == JPGD_YH2V2) || (m_scan_type == JPGD_YH1V2));
+		const bool chroma_y_filtering = (m_scale_denom == 1) && ((m_flags & cFlagBoxChromaFiltering) == 0) && ((m_scan_type == JPGD_YH2V2) || (m_scan_type == JPGD_YH1V2));
 		if (chroma_y_filtering)
 		{
 			std::swap(m_pSample_buf, m_pSample_buf_prev);
@@ -2141,10 +2469,10 @@ namespace jpgd {
 			decode_next_row();
 
 		// Find the EOI marker if that was the last row.
-		if (m_total_lines_left <= m_max_mcu_y_size)
+		if (m_total_lines_left <= m_scale_mcu_y_size)
 			find_eoi();
 
-		m_mcu_lines_left = m_max_mcu_y_size;
+		m_mcu_lines_left = m_scale_mcu_y_size;
 		return 0;
 	}
 
@@ -2155,6 +2483,23 @@ namespace jpgd {
 
 		if (m_total_lines_left == 0)
 			return JPGD_DONE;
+
+		if (m_scale_denom > 1)
+		{
+			if (m_mcu_lines_left == 0)
+			{
+				int status = decode_next_mcu_row();
+				if (status != 0)
+					return status;
+			}
+
+			scaled_convert();
+			*pScan_line = m_pScan_line_0;
+			*pScan_line_len = m_real_dest_bytes_per_scan_line;
+			m_mcu_lines_left--;
+			m_total_lines_left--;
+			return JPGD_SUCCESS;
+		}
 
 		const bool chroma_y_filtering = ((m_flags & cFlagBoxChromaFiltering) == 0) && ((m_scan_type == JPGD_YH2V2) || (m_scan_type == JPGD_YH1V2));
 
@@ -2619,15 +2964,38 @@ namespace jpgd {
 		m_max_mcus_per_row = (m_image_x_size + (m_max_mcu_x_size - 1)) / m_max_mcu_x_size;
 		m_max_mcus_per_col = (m_image_y_size + (m_max_mcu_y_size - 1)) / m_max_mcu_y_size;
 
+		if (m_scale_denom > 1)
+		{
+			m_output_x_size = (m_image_x_size + m_scale_denom - 1) / m_scale_denom;
+			m_output_y_size = (m_image_y_size + m_scale_denom - 1) / m_scale_denom;
+			m_scale_mcu_x_size = m_max_mcu_x_size / m_scale_denom;
+			m_scale_mcu_y_size = m_max_mcu_y_size / m_scale_denom;
+		}
+		else
+		{
+			m_output_x_size = m_image_x_size;
+			m_output_y_size = m_image_y_size;
+			m_scale_mcu_x_size = m_max_mcu_x_size;
+			m_scale_mcu_y_size = m_max_mcu_y_size;
+		}
+
 		// These values are for the *destination* pixels: after conversion.
 		if (m_scan_type == JPGD_GRAYSCALE)
 			m_dest_bytes_per_pixel = 1;
 		else
 			m_dest_bytes_per_pixel = 4;
 
-		m_dest_bytes_per_scan_line = ((m_image_x_size + 15) & 0xFFF0) * m_dest_bytes_per_pixel;
-
-		m_real_dest_bytes_per_scan_line = (m_image_x_size * m_dest_bytes_per_pixel);
+		if (m_scale_denom > 1)
+		{
+			const int padded_blocks_width = m_max_mcus_per_row * m_scale_mcu_x_size;
+			m_dest_bytes_per_scan_line = ((padded_blocks_width + 15) & 0xFFF0) * m_dest_bytes_per_pixel;
+			m_real_dest_bytes_per_scan_line = m_output_x_size * m_dest_bytes_per_pixel;
+		}
+		else
+		{
+			m_dest_bytes_per_scan_line = ((m_image_x_size + 15) & 0xFFF0) * m_dest_bytes_per_pixel;
+			m_real_dest_bytes_per_scan_line = (m_image_x_size * m_dest_bytes_per_pixel);
+		}
 
 		// Initialize two scan line buffers.
 		m_pScan_line_0 = (uint8*)alloc_aligned(m_dest_bytes_per_scan_line, true);
@@ -2646,10 +3014,10 @@ namespace jpgd {
 		for (i = 0; i < m_max_blocks_per_mcu; i++)
 			m_mcu_block_max_zag[i] = 64;
 
-		m_pSample_buf = (uint8*)alloc_aligned(m_max_blocks_per_row * 64);
-		m_pSample_buf_prev = (uint8*)alloc_aligned(m_max_blocks_per_row * 64);
+		m_pSample_buf = (uint8*)alloc_aligned(m_max_blocks_per_row * m_scale_block_size);
+		m_pSample_buf_prev = (uint8*)alloc_aligned(m_max_blocks_per_row * m_scale_block_size);
 
-		m_total_lines_left = m_image_y_size;
+		m_total_lines_left = (m_scale_denom > 1) ? m_output_y_size : m_image_y_size;
 
 		m_mcu_lines_left = 0;
 
@@ -3063,6 +3431,20 @@ namespace jpgd {
 		return JPGD_SUCCESS;
 	}
 
+	int jpeg_decoder::set_downsample_factor(int downscale_denom)
+	{
+		if (m_ready_flag)
+			return JPGD_FAILED;
+
+		if ((downscale_denom != 1) && (downscale_denom != 2) && (downscale_denom != 4) && (downscale_denom != 8))
+			return JPGD_FAILED;
+
+		m_scale_denom = downscale_denom;
+		m_scale_block_dim = 8 / downscale_denom;
+		m_scale_block_size = m_scale_block_dim * m_scale_block_dim;
+		return JPGD_SUCCESS;
+	}
+
 	jpeg_decoder::~jpeg_decoder()
 	{
 		free_all_blocks();
@@ -3165,6 +3547,248 @@ namespace jpgd {
 		m_ofs += max_bytes_to_read;
 
 		return max_bytes_to_read;
+	}
+
+	static unsigned char* decompress_jpeg_image_scaled_from_stream(jpeg_decoder_stream* pStream, int downscale_denom, int* width, int* height, int* actual_comps, int req_comps, uint32_t flags)
+	{
+		if (!actual_comps)
+			return nullptr;
+		*actual_comps = 0;
+
+		if ((!pStream) || (!width) || (!height) || (!req_comps))
+			return nullptr;
+
+		if ((req_comps != 1) && (req_comps != 3) && (req_comps != 4))
+			return nullptr;
+
+		if ((downscale_denom != 1) && (downscale_denom != 2) && (downscale_denom != 4) && (downscale_denom != 8))
+			return nullptr;
+
+		jpeg_decoder decoder(pStream, flags);
+		if (decoder.get_error_code() != JPGD_SUCCESS)
+			return nullptr;
+
+		if (decoder.set_downsample_factor(downscale_denom) != JPGD_SUCCESS)
+			return nullptr;
+
+		const int image_width = decoder.get_output_width();
+		const int image_height = decoder.get_output_height();
+		*width = image_width;
+		*height = image_height;
+		*actual_comps = decoder.get_num_components();
+
+		if (decoder.begin_decoding() != JPGD_SUCCESS)
+			return nullptr;
+
+		const int dst_bpl = image_width * req_comps;
+		uint8* pImage_data = (uint8*)jpgd_malloc(dst_bpl * image_height);
+		if (!pImage_data)
+			return nullptr;
+
+		for (int y = 0; y < image_height; y++)
+		{
+			const uint8* pScan_line;
+			uint scan_line_len;
+			if (decoder.decode((const void**)&pScan_line, &scan_line_len) != JPGD_SUCCESS)
+			{
+				jpgd_free(pImage_data);
+				return nullptr;
+			}
+
+			uint8* pDst = pImage_data + y * dst_bpl;
+
+			if (((req_comps == 1) && (decoder.get_num_components() == 1)) || ((req_comps == 4) && (decoder.get_num_components() == 3)))
+				memcpy(pDst, pScan_line, dst_bpl);
+			else if (decoder.get_num_components() == 1)
+			{
+				for (int x = 0; x < image_width; x++)
+				{
+					const uint8 luma = pScan_line[x];
+					pDst[0] = luma;
+					if (req_comps >= 3)
+					{
+						pDst[1] = luma;
+						pDst[2] = luma;
+					}
+					if (req_comps == 4)
+						pDst[3] = 255;
+					pDst += req_comps;
+				}
+			}
+			else
+			{
+				if (req_comps == 1)
+				{
+					const int YR = 19595, YG = 38470, YB = 7471;
+					for (int x = 0; x < image_width; x++)
+					{
+						const int r = pScan_line[x * 4 + 0];
+						const int g = pScan_line[x * 4 + 1];
+						const int b = pScan_line[x * 4 + 2];
+						*pDst++ = static_cast<uint8>((r * YR + g * YG + b * YB + 32768) >> 16);
+					}
+				}
+				else
+				{
+					for (int x = 0; x < image_width; x++)
+					{
+						pDst[0] = pScan_line[x * 4 + 0];
+						pDst[1] = pScan_line[x * 4 + 1];
+						pDst[2] = pScan_line[x * 4 + 2];
+						if (req_comps == 4)
+							pDst[3] = 255;
+						pDst += req_comps;
+					}
+				}
+			}
+		}
+
+		return pImage_data;
+	}
+
+	static unsigned char* decompress_jpeg_image_box_downsampled_from_stream(jpeg_decoder_stream* pStream, int downscale_denom, int* width, int* height, int* actual_comps, int req_comps, uint32_t flags)
+	{
+		if (!actual_comps)
+			return nullptr;
+		*actual_comps = 0;
+
+		if ((!pStream) || (!width) || (!height) || (!req_comps))
+			return nullptr;
+
+		if ((req_comps != 1) && (req_comps != 3) && (req_comps != 4))
+			return nullptr;
+
+		if ((downscale_denom != 1) && (downscale_denom != 2) && (downscale_denom != 4) && (downscale_denom != 8))
+			return nullptr;
+
+		jpeg_decoder decoder(pStream, flags);
+		if (decoder.get_error_code() != JPGD_SUCCESS)
+			return nullptr;
+
+		const int full_width = decoder.get_width();
+		const int full_height = decoder.get_height();
+		const int image_width = (full_width + downscale_denom - 1) / downscale_denom;
+		const int image_height = (full_height + downscale_denom - 1) / downscale_denom;
+		*width = image_width;
+		*height = image_height;
+		*actual_comps = decoder.get_num_components();
+
+		if (decoder.begin_decoding() != JPGD_SUCCESS)
+			return nullptr;
+
+		const int dst_bpl = image_width * req_comps;
+		const int src_bpl = full_width * req_comps;
+		uint8* pImage_data = (uint8*)jpgd_malloc(dst_bpl * image_height);
+		uint8* pLine = (uint8*)jpgd_malloc(src_bpl);
+		uint32_t* pAcc = (uint32_t*)jpgd_malloc(image_width * req_comps * sizeof(uint32_t));
+		if ((!pImage_data) || (!pLine) || (!pAcc))
+		{
+			jpgd_free(pImage_data);
+			jpgd_free(pLine);
+			jpgd_free(pAcc);
+			return nullptr;
+		}
+
+		for (int oy = 0; oy < image_height; oy++)
+		{
+			const int y0 = oy * downscale_denom;
+			const int y1 = JPGD_MIN(y0 + downscale_denom, full_height);
+			memset(pAcc, 0, image_width * req_comps * sizeof(uint32_t));
+
+			for (int y = y0; y < y1; y++)
+			{
+				const uint8* pScan_line;
+				uint scan_line_len;
+				if (decoder.decode((const void**)&pScan_line, &scan_line_len) != JPGD_SUCCESS)
+				{
+					jpgd_free(pImage_data);
+					jpgd_free(pLine);
+					jpgd_free(pAcc);
+					return nullptr;
+				}
+
+				const uint8* pAccum_line = pScan_line;
+				int accum_stride = req_comps;
+				uint8* pDst = pLine;
+				if (((req_comps == 1) && (decoder.get_num_components() == 1)) || ((req_comps == 4) && (decoder.get_num_components() == 3)))
+				{
+					// The decoder already produces the requested packed layout.
+				}
+				else if ((req_comps == 3) && (decoder.get_num_components() == 3))
+				{
+					accum_stride = 4;
+				}
+				else if (decoder.get_num_components() == 1)
+				{
+					pAccum_line = pLine;
+					for (int x = 0; x < full_width; x++)
+					{
+						const uint8 luma = pScan_line[x];
+						pDst[0] = luma;
+						if (req_comps >= 3)
+						{
+							pDst[1] = luma;
+							pDst[2] = luma;
+						}
+						if (req_comps == 4)
+							pDst[3] = 255;
+						pDst += req_comps;
+					}
+				}
+				else if (req_comps == 1)
+				{
+					pAccum_line = pLine;
+					const int YR = 19595, YG = 38470, YB = 7471;
+					for (int x = 0; x < full_width; x++)
+					{
+						const int r = pScan_line[x * 4 + 0];
+						const int g = pScan_line[x * 4 + 1];
+						const int b = pScan_line[x * 4 + 2];
+						*pDst++ = static_cast<uint8>((r * YR + g * YG + b * YB + 32768) >> 16);
+					}
+				}
+				else
+				{
+					pAccum_line = pLine;
+					for (int x = 0; x < full_width; x++)
+					{
+						pDst[0] = pScan_line[x * 4 + 0];
+						pDst[1] = pScan_line[x * 4 + 1];
+						pDst[2] = pScan_line[x * 4 + 2];
+						if (req_comps == 4)
+							pDst[3] = 255;
+						pDst += req_comps;
+					}
+				}
+
+				for (int ox = 0; ox < image_width; ox++)
+				{
+					const int x0 = ox * downscale_denom;
+					const int x1 = JPGD_MIN(x0 + downscale_denom, full_width);
+					uint32_t* pOut = pAcc + ox * req_comps;
+					for (int x = x0; x < x1; x++)
+					{
+						const uint8* pSrc = pAccum_line + x * accum_stride;
+						for (int c = 0; c < req_comps; c++)
+							pOut[c] += pSrc[c];
+					}
+				}
+			}
+
+			for (int ox = 0; ox < image_width; ox++)
+			{
+				const int x0 = ox * downscale_denom;
+				const int x1 = JPGD_MIN(x0 + downscale_denom, full_width);
+				const uint32_t count = (uint32_t)((x1 - x0) * (y1 - y0));
+				const uint32_t half = count / 2;
+				for (int c = 0; c < req_comps; c++)
+					pImage_data[oy * dst_bpl + ox * req_comps + c] = (uint8)((pAcc[ox * req_comps + c] + half) / count);
+			}
+		}
+
+		jpgd_free(pLine);
+		jpgd_free(pAcc);
+		return pImage_data;
 	}
 
 	unsigned char* decompress_jpeg_image_from_stream(jpeg_decoder_stream* pStream, int* width, int* height, int* actual_comps, int req_comps, uint32_t flags)
@@ -3278,6 +3902,34 @@ namespace jpgd {
 		if (!file_stream.open(pSrc_filename))
 			return nullptr;
 		return decompress_jpeg_image_from_stream(&file_stream, width, height, actual_comps, req_comps, flags);
+	}
+
+	unsigned char* decompress_jpeg_image_scaled_from_memory(const unsigned char* pSrc_data, int src_data_size, int downscale_denom, int* width, int* height, int* actual_comps, int req_comps, uint32_t flags)
+	{
+		jpgd::jpeg_decoder_mem_stream mem_stream(pSrc_data, src_data_size);
+		return decompress_jpeg_image_scaled_from_stream(&mem_stream, downscale_denom, width, height, actual_comps, req_comps, flags);
+	}
+
+	unsigned char* decompress_jpeg_image_scaled_from_file(const char* pSrc_filename, int downscale_denom, int* width, int* height, int* actual_comps, int req_comps, uint32_t flags)
+	{
+		jpgd::jpeg_decoder_file_stream file_stream;
+		if (!file_stream.open(pSrc_filename))
+			return nullptr;
+		return decompress_jpeg_image_scaled_from_stream(&file_stream, downscale_denom, width, height, actual_comps, req_comps, flags);
+	}
+
+	unsigned char* decompress_jpeg_image_box_downsampled_from_memory(const unsigned char* pSrc_data, int src_data_size, int downscale_denom, int* width, int* height, int* actual_comps, int req_comps, uint32_t flags)
+	{
+		jpgd::jpeg_decoder_mem_stream mem_stream(pSrc_data, src_data_size);
+		return decompress_jpeg_image_box_downsampled_from_stream(&mem_stream, downscale_denom, width, height, actual_comps, req_comps, flags);
+	}
+
+	unsigned char* decompress_jpeg_image_box_downsampled_from_file(const char* pSrc_filename, int downscale_denom, int* width, int* height, int* actual_comps, int req_comps, uint32_t flags)
+	{
+		jpgd::jpeg_decoder_file_stream file_stream;
+		if (!file_stream.open(pSrc_filename))
+			return nullptr;
+		return decompress_jpeg_image_box_downsampled_from_stream(&file_stream, downscale_denom, width, height, actual_comps, req_comps, flags);
 	}
 
 } // namespace jpgd
